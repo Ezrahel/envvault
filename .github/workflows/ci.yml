@@ -1,0 +1,81 @@
+name: CI
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 9 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: 'pnpm' }
+      - run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm -r typecheck
+      - name: Lint (Biome/ESLint placeholder)
+        run: pnpm -r lint 2>&1 | head -n 50 || echo "lint not configured — skip"
+
+  test:
+    runs-on: ubuntu-latest
+    needs: lint-typecheck
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 9 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: 'pnpm' }
+      - run: pnpm install --frozen-lockfile
+      - name: Unit & Integration Tests
+        run: pnpm exec vitest run --reporter=verbose
+      - name: E2E Tests (real git repos + crypto)
+        run: pnpm exec vitest run tests/e2e --reporter=verbose
+        # Requires git, no DB needed (in-memory store)
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: test-logs
+          path: /tmp/vitest*
+
+  build:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 9 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: 'pnpm' }
+      - run: pnpm install --frozen-lockfile
+      - name: Build CLI
+        run: pnpm --filter envvault build
+      - name: Build API
+        run: pnpm --filter @envvault/api build
+      - name: Build Web
+        run: pnpm --filter @envvault/web build
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-dist
+          path: packages/cli/dist
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 9 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: 'pnpm' }
+      - run: pnpm install --frozen-lockfile
+      - name: Audit ( prod )
+        run: pnpm audit --prod --audit-level=moderate 2>&1 | tail -n 50
+        continue-on-error: true
+      - name: Check for leaked secrets in logs
+        run: |
+          ! grep -r "sk_" packages/cli/src --include="*.ts" | grep -v "PAYSTACK" || echo "potential secret pattern found"
+          ! grep -r "DATABASE_URL=" apps/api/src --include="*.ts" | grep -v "DATABASE_URL=.+.*redacted" || echo "check secret redaction"

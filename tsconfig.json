@@ -1,0 +1,19 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "composite": false
+  },
+  "include": ["packages/*/src", "apps/*/src", "tests/**/*"],
+  "references": [
+    { "path": "./packages/shared" },
+    { "path": "./packages/git" },
+    { "path": "./packages/crypto" },
+    { "path": "./packages/env-parser" },
+    { "path": "./packages/config" },
+    { "path": "./packages/sdk" },
+    { "path": "./packages/database" },
+    { "path": "./packages/cli" },
+    { "path": "./apps/api" },
+    { "path": "./apps/web" }
+  ]
+}

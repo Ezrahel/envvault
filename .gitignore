@@ -1,0 +1,17 @@
+node_modules
+dist
+.build
+.next
+out
+coverage
+*.tsbuildinfo
+.env
+.env.local
+.env.*.local
+.pnpm-store
+.DS_Store
+.turbo
+*.log
+apps/api/.env
+packages/cli/.envvault
+tmp

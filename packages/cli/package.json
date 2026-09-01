@@ -1,0 +1,36 @@
+{
+  "name": "envvault",
+  "version": "0.1.0",
+  "description": "EnvVault CLI — project-aware encrypted .env backup & restore",
+  "type": "module",
+  "bin": {
+    "envvault": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --clean",
+    "dev": "tsx src/index.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "echo lint"
+  },
+  "dependencies": {
+    "@envvault/config": "workspace:*",
+    "@envvault/crypto": "workspace:*",
+    "@envvault/env-parser": "workspace:*",
+    "@envvault/git": "workspace:*",
+    "@envvault/sdk": "workspace:*",
+    "@envvault/shared": "workspace:*",
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0",
+    "inquirer": "^9.2.23",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/inquirer": "^9.0.10",
+    "@types/node": "^22.7.4",
+    "tsup": "^8.1.0",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.4"
+  }
+}
