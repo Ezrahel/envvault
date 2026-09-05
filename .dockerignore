@@ -1,0 +1,26 @@
+# Keep build context small + never leak local secrets into images.
+node_modules
+.next
+out
+dist
+build
+coverage
+.git
+.gitignore
+.github
+.vscode
+.idea
+*.log
+*.tsbuildinfo
+.turbo
+.pnpm-store
+apps/api/data
+apps/api/.env
+apps/api/.env.local
+apps/web/.env.local
+packages/cli/.envvault
+data/
+tmp/
+.env
+.env.local
+.env.*.local

@@ -1,10 +1,41 @@
+# EnvVault Web — production image using Next.js standalone output.
+# Stress-free: offline-safe (no Google Fonts fetch), deterministic install,
+# build-time API URL via ARG, tiny non-root runner.
 FROM node:22-alpine AS base
 WORKDIR /app
-RUN corepack enable pnpm
-COPY package.json pnpm-workspace.yaml ./
+RUN corepack enable && corepack prepare pnpm@9.12.0 --activate
+ENV COREPACK_ENABLE_STRICT=0
+
+FROM base AS builder
+ARG NEXT_PUBLIC_API_URL=http://localhost:3001
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL \
+    NEXT_TELEMETRY_DISABLED=1
+
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml tsconfig.base.json tsconfig.json ./
+COPY apps/web/package.json ./apps/web/package.json
 COPY packages ./packages
+RUN pnpm install --frozen-lockfile
+
 COPY apps/web ./apps/web
-RUN pnpm install --frozen-lockfile || pnpm install
 RUN pnpm --filter @envvault/web build
+
+FROM node:22-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1 \
+    PORT=3000 \
+    HOSTNAME=0.0.0.0
 EXPOSE 3000
-CMD ["pnpm", "--filter", "@envvault/web", "start"]
+
+USER node
+
+# Standalone server (does not need node_modules / pnpm at runtime)
+COPY --from=builder --chown=node:node /app/apps/web/.next/standalone ./
+COPY --from=builder --chown=node:node /app/apps/web/.next/static ./apps/web/.next/static
+# `public/` is optional — only copy if present (no failure when missing)
+# (handled via wildcard-tolerant step in compose/CI; image works without it)
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:3000/').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+
+CMD ["node", "apps/web/server.js"]

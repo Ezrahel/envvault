@@ -80,8 +80,18 @@ export function normalizeRemote(raw: string): GitRepositoryIdentity {
 
   if (!pathPart) throw new Error(`Cannot extract path from remote: ${raw}`);
 
-  // Split path into parts
-  const parts = pathPart.split("/").filter(Boolean);
+  // Split path into parts — decode percent-encoding from URL parsing
+  // (e.g. https://github.com/<username>/<repository> becomes %3C...%3E via URL)
+  const parts = pathPart
+    .split("/")
+    .filter(Boolean)
+    .map((p) => {
+      try {
+        return decodeURIComponent(p);
+      } catch {
+        return p;
+      }
+    });
   if (parts.length === 0) throw new Error(`Empty repository path: ${raw}`);
 
   const repository = parts[parts.length - 1]!;

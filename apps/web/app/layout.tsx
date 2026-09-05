@@ -1,11 +1,15 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { CommandPalette } from "@/components/command-palette";
 import { Toaster } from "sonner";
 
-const geistSans = Geist({ subsets: ["latin"], variable: "--font-geist-sans" });
-const geistMono = Geist_Mono({ subsets: ["latin"], variable: "--font-geist-mono" });
+// NOTE: We intentionally avoid `next/font/google` (Geist) here.
+// It fetches from fonts.googleapis.com at build time and breaks
+// Docker / offline / air-gapped builds. Use system font stacks
+// with the same CSS variable names so Tailwind `font-sans`/`font-mono`
+// keep working with zero network dependency.
+const geistSans = { variable: "" } as const;
+const geistMono = { variable: "" } as const;
 
 export const metadata: Metadata = {
   title: "EnvVault — Your development environment, anywhere",

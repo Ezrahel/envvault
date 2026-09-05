@@ -55,4 +55,25 @@ try {
   process.exit(1);
 }
 
+// Graceful shutdown for Docker / K8s (SIGTERM) and Ctrl+C (SIGINT) —
+// lets Fastify drain connections and close DB instead of hard-killing.
+let shuttingDown = false;
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  app.log.info({ signal }, "shutting down");
+  try {
+    await app.close();
+    const { closeDb } = await import("./lib/db.js");
+    await closeDb();
+  } catch (err) {
+    app.log.error({ err }, "error during shutdown");
+  } finally {
+    process.exit(0);
+  }
+}
+for (const sig of ["SIGTERM", "SIGINT"] as const) {
+  process.on(sig, () => void shutdown(sig));
+}
+
 export { app };
