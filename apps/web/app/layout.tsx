@@ -46,7 +46,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <a href="/security" className="hover:text-zinc-300 underline decoration-zinc-700 underline-offset-4">Security</a> ·{" "}
           <a href="/privacy" className="hover:text-zinc-300 underline decoration-zinc-700 underline-offset-4">Privacy</a> ·{" "}
           <a href="/terms" className="hover:text-zinc-300 underline decoration-zinc-700 underline-offset-4">Terms</a> ·{" "}
-          <a href="https://github.com" className="hover:text-zinc-300 underline decoration-zinc-700 underline-offset-4">Docs</a>
+          <a href="https://github.com/ezrahel/envvault" className="hover:text-zinc-300 underline decoration-zinc-700 underline-offset-4">Docs</a>
         </footer>
         <Toaster theme="dark" toastOptions={{ style: { background: "#171717", border: "1px solid #27272a", color: "#fafafa" } }} />
       </body>

@@ -251,7 +251,7 @@ npm run dev`;
         <p className="mx-auto mt-2 max-w-[520px] text-sm text-zinc-400">Your development environment, available on any machine. Clone. Pull. Run.</p>
         <div className="mt-6 flex justify-center gap-3">
           <Link href="/dashboard"><Button size="lg">Get started — npm install -g envvault</Button></Link>
-          <a href="https://github.com" className="inline-flex h-9 items-center rounded-md border border-zinc-800 bg-zinc-900 px-4 text-sm hover:bg-zinc-800">View on GitHub</a>
+          <a href="https://github.com/ezrahel/envvault" className="inline-flex h-9 items-center rounded-md border border-zinc-800 bg-zinc-900 px-4 text-sm hover:bg-zinc-800">View on GitHub</a>
         </div>
         <div className="mx-auto mt-4 flex max-w-[560px] items-center gap-2 rounded-md border border-zinc-800 bg-black p-2 font-mono text-xs text-zinc-300">
           <Terminal className="h-4 w-4 text-zinc-500" />
