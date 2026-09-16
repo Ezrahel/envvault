@@ -27,14 +27,23 @@ export class ApiClient {
     return h;
   }
 
-  async login(email: string, _password?: string): Promise<{ token: string; userId: string }> {
-    // Mock for MVP – in production would call /v1/auth/login with OAuth etc.
+  async login(email: string, password?: string): Promise<{ token: string; userId: string }> {
     const res = await this.f(`${this.baseUrl}/v1/auth/login`, {
       method: "POST",
       headers: this.headers(),
-      body: JSON.stringify({ email }),
+      body: JSON.stringify({ email, ...(password ? { password } : {}) }),
     });
     if (!res.ok) throw new Error(`login failed: ${res.status}`);
+    return res.json() as Promise<{ token: string; userId: string }>;
+  }
+
+  async register(email: string, password: string): Promise<{ token: string; userId: string }> {
+    const res = await this.f(`${this.baseUrl}/v1/auth/register`, {
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify({ email, password }),
+    });
+    if (!res.ok) throw new Error(`register failed: ${res.status}`);
     return res.json() as Promise<{ token: string; userId: string }>;
   }
 

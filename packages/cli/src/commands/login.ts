@@ -4,7 +4,7 @@ import { saveAuth } from "../auth/store.js";
 import { randomUUID } from "node:crypto";
 import { getApiClient } from "../api/client.js";
 
-export async function loginCommand(opts: { email?: string; github?: boolean } = {}) {
+export async function loginCommand(opts: { email?: string; password?: string; github?: boolean } = {}) {
   if (opts.github) {
     console.log(chalk.blue("Opening browser to authenticate with GitHub..."));
     console.log(chalk.dim("GitHub OAuth is central to EnvVault (repository identity) per spec §51."));
@@ -37,6 +37,15 @@ export async function loginCommand(opts: { email?: string; github?: boolean } = 
     email = ans.email;
   }
 
+  // Password: flag > env var > secure prompt (empty = legacy passwordless, dev only).
+  let password = opts.password ?? process.env.ENVVAULT_PASSWORD;
+  if (password === undefined && !opts.github) {
+    const ans = await inquirer.prompt<{ password: string }>([
+      { type: "password", name: "password", message: "Password (leave empty for dev-only passwordless login):", mask: "*" },
+    ]);
+    password = ans.password || undefined;
+  }
+
   // Try API login first if reachable — registers token in API store so push/pull can authenticate
   let token: string | null = null;
   let userId: string | null = null;
@@ -45,7 +54,7 @@ export async function loginCommand(opts: { email?: string; github?: boolean } = 
     // Override token for login (no token yet)
     (api as any).token = undefined;
     const endpoint = opts.github ? "/v1/auth/github" : "/v1/auth/login";
-    const body: any = opts.github ? { email, githubUser: (opts as any).githubUser ?? "ademola", provider: "github" } : { email };
+    const body: any = opts.github ? { email, githubUser: (opts as any).githubUser ?? "ademola", provider: "github" } : { email, ...(password ? { password } : {}) };
     const res = await (api as any).f(`${(api as any).baseUrl}${endpoint}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -63,7 +72,7 @@ export async function loginCommand(opts: { email?: string; github?: boolean } = 
         const fallback = await (api as any).f(`${(api as any).baseUrl}/v1/auth/login`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ email }),
+          body: JSON.stringify({ email, ...(password ? { password } : {}) }),
         });
         if (fallback.ok) {
           const data = (await fallback.json()) as { token: string; userId: string };

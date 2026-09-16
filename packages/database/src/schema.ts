@@ -5,6 +5,8 @@ export const users = pgTable("users", {
   email: varchar("email", { length: 255 }).notNull().unique(),
   name: text("name"),
   avatarUrl: text("avatar_url"),
+  // scrypt password hash (`scrypt$n$r$p$salt$hash`). Null for legacy passwordless accounts.
+  passwordHash: text("password_hash"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });
@@ -40,6 +42,7 @@ export const environments = pgTable(
       .notNull()
       .references(() => projects.id, { onDelete: "cascade" }),
     name: varchar("name", { length: 100 }).notNull(),
+    createdBy: uuid("created_by").references(() => users.id),
     createdAt: timestamp("created_at").defaultNow().notNull(),
     updatedAt: timestamp("updated_at").defaultNow().notNull(),
   },
@@ -74,6 +77,12 @@ export const secretVersions = pgTable("secret_versions", {
   cipherAlgorithm: varchar("cipher_algorithm", { length: 50 }).notNull(),
   keyVersion: integer("key_version").notNull(),
   nonce: text("nonce").notNull(),
+  // Envelope extras: ciphertext is the *encrypted* blob (never plaintext).
+  // Object storage (R2) remains the primary ciphertext store; this column keeps
+  // listVersions fast and provides a fallback copy.
+  authTag: text("auth_tag"),
+  ciphertext: text("ciphertext"),
+  formatVersion: integer("format_version").default(1),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   createdBy: uuid("created_by").references(() => users.id),
 });
@@ -97,5 +106,15 @@ export const auditLogs = pgTable("audit_logs", {
   action: varchar("action", { length: 100 }).notNull(),
   deviceId: uuid("device_id").references(() => devices.id),
   ipHash: text("ip_hash"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+// Revoked JWTs (logout / refresh rotation). Stateless JWT verification
+// checks this table; rows can be pruned once past their `expiresAt`.
+export const revokedTokens = pgTable("revoked_tokens", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  jti: varchar("jti", { length: 100 }).notNull().unique(),
+  userId: uuid("user_id").references(() => users.id, { onDelete: "cascade" }),
+  expiresAt: timestamp("expires_at").notNull(),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });

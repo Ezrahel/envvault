@@ -30,7 +30,8 @@ program
 program
   .command("login")
   .description("Authenticate via browser (GitHub OAuth preferred per spec §51)")
-  .option("--email <email>", "email for mock login")
+  .option("--email <email>", "email for login")
+  .option("--password <password>", "password (or set ENVVAULT_PASSWORD; prompted securely if omitted)")
   .option("--github", "Login via GitHub OAuth (recommended)")
   .action(async (opts) => {
     try {

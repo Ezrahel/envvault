@@ -1,6 +1,8 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
+import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 /**
  * Object Storage abstraction — per spec §67-68
@@ -17,8 +19,6 @@ export interface StorageProvider {
   generateSignedUrl(key: string, expiresInSeconds?: number): Promise<string>;
   deleteObject(key: string): Promise<void>;
 }
-
-const USE_R2 = !!(process.env.R2_ACCOUNT_ID && process.env.R2_ACCESS_KEY_ID);
 
 class LocalStorage implements StorageProvider {
   private baseDir: string;
@@ -62,37 +62,87 @@ class LocalStorage implements StorageProvider {
 }
 
 class R2Storage implements StorageProvider {
-  // Placeholder for Cloudflare R2 / S3-compatible storage
-  // In production, use @aws-sdk/client-s3 + @aws-sdk/s3-presigned-post
+  // Cloudflare R2 / S3-compatible storage: private bucket, SSE, short-lived signed URLs.
+  private client: S3Client;
+  private bucket: string;
   private localFallback = new LocalStorage();
 
+  constructor() {
+    const accountId = process.env.R2_ACCOUNT_ID!;
+    this.bucket = process.env.R2_BUCKET!;
+    this.client = new S3Client({
+      region: "auto",
+      endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
+      credentials: {
+        accessKeyId: process.env.R2_ACCESS_KEY_ID!,
+        secretAccessKey: process.env.R2_SECRET_ACCESS_KEY!,
+      },
+      // R2 requires path-style for some setups; virtual-hosted works with endpoint above.
+      forcePathStyle: false,
+    });
+  }
+
   async putObject(key: string, data: Buffer): Promise<void> {
-    // TODO: implement with S3Client
-    // const client = new S3Client({ region: "auto", endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com` })
-    // await client.send(new PutObjectCommand({ Bucket: process.env.R2_BUCKET!, Key: key, Body: data, ServerSideEncryption: "AES256" }))
-    return this.localFallback.putObject(key, data);
+    try {
+      await this.client.send(
+        new PutObjectCommand({ Bucket: this.bucket, Key: key, Body: data, ServerSideEncryption: "AES256" })
+      );
+    } catch (e) {
+      // Fail open to local fallback would silently split storage locations — don't.
+      // Surface the error so uploads visibly fail instead of vanishing.
+      throw new Error(`R2 putObject failed: ${(e as Error).message}`);
+    }
   }
 
   async getObject(key: string): Promise<Buffer | null> {
-    return this.localFallback.getObject(key);
+    try {
+      const res = await this.client.send(new GetObjectCommand({ Bucket: this.bucket, Key: key }));
+      if (!res.Body) return null;
+      const chunks: Buffer[] = [];
+      for await (const chunk of res.Body as any) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      return Buffer.concat(chunks);
+    } catch {
+      return null;
+    }
   }
 
   async generateSignedUrl(key: string, expiresInSeconds = 900): Promise<string> {
-    // TODO: generate presigned URL via getSignedUrl(client, new GetObjectCommand(...), { expiresIn })
-    return this.localFallback.generateSignedUrl(key, expiresInSeconds);
+    return getSignedUrl(this.client, new GetObjectCommand({ Bucket: this.bucket, Key: key }), {
+      expiresIn: expiresInSeconds,
+    });
   }
 
   async deleteObject(key: string): Promise<void> {
-    return this.localFallback.deleteObject(key);
+    try {
+      await this.client.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: key }));
+    } catch {
+      // best-effort delete
+    }
   }
+}
+
+function r2Configured(): boolean {
+  return !!(
+    process.env.R2_ACCOUNT_ID &&
+    process.env.R2_ACCESS_KEY_ID &&
+    process.env.R2_SECRET_ACCESS_KEY &&
+    process.env.R2_BUCKET
+  );
 }
 
 let singleton: StorageProvider | null = null;
 
 export function getStorage(): StorageProvider {
   if (singleton) return singleton;
-  singleton = USE_R2 ? new R2Storage() : new LocalStorage();
+  singleton = r2Configured() ? new R2Storage() : new LocalStorage();
   return singleton;
+}
+
+/** For tests: reset the singleton so env changes take effect. */
+export function _resetStorage(): void {
+  singleton = null;
 }
 
 // Helper to build object key per spec §67

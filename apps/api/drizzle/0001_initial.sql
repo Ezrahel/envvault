@@ -1,7 +1,6 @@
 -- EnvVault initial migration per spec §31 Database Schema
--- Production PostgreSQL with point-in-time recovery, encrypted backups, retention
-
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+-- Targets CockroachDB (Postgres-wire compatible) with backups, encryption at rest, retention.
+-- NOTE: gen_random_uuid() is built-in on CockroachDB and PostgreSQL 13+ — no extension needed.
 
 CREATE TABLE IF NOT EXISTS "users" (
   "id" uuid PRIMARY KEY DEFAULT gen_random_uuid(),
