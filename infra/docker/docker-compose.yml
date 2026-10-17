@@ -1,9 +1,11 @@
 # EnvVault — stress-free local prod-like deploy on CockroachDB:
-#   docker compose -f infra/docker/docker-compose.yml up --build
+#   cp infra/docker/.env.example infra/docker/.env
+#   openssl rand -base64 48  # paste the result into infra/docker/.env as JWT_SECRET
+#   docker compose --env-file infra/docker/.env -f infra/docker/docker-compose.yml up --build
 # Production: point DATABASE_URL at CockroachDB Cloud and set secrets via env.
 services:
   cockroach:
-    image: cockroachdb/cockroach:v24.3
+    image: cockroachdb/cockroach:v24.3.10
     command: start-single-node --insecure --advertise-addr=cockroach
     restart: unless-stopped
     ports:
@@ -19,7 +21,7 @@ services:
 
   # One-shot: creates the envvault database (Cockroach has no POSTGRES_DB equivalent).
   cockroach-init:
-    image: cockroachdb/cockroach:v24.3
+    image: cockroachdb/cockroach:v24.3.10
     command: ["sql", "--insecure", "--host=cockroach:26257", "-e", "CREATE DATABASE IF NOT EXISTS envvault;"]
     depends_on:
       cockroach:

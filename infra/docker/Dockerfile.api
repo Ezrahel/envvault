@@ -23,6 +23,7 @@ ENV NODE_ENV=production \
 EXPOSE 3001
 
 # Drop privileges — node image ships with `node` user
+RUN mkdir -p /app/data && chown node:node /app/data
 USER node
 
 # /health returns 200 when ok, /ready returns 503 when DB degraded

@@ -7,10 +7,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const nextConfig = {
   // Standalone output = tiny Docker runner (`server.js`), no pnpm needed at runtime.
   output: "standalone",
+  typedRoutes: false,
   // Monorepo: trace from workspace root so `standalone/` is portable
   // (otherwise it embeds absolute host paths like /home/user/...).
   outputFileTracingRoot: path.join(__dirname, "../.."),
   transpilePackages: ["@envvault/shared", "@envvault/ui"],
-  experimental: { typedRoutes: false },
 };
 export default nextConfig;
