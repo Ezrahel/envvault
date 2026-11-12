@@ -12,6 +12,14 @@ export interface JwtPayload {
   iat: number; // seconds
   exp: number; // seconds
   type: "access" | "refresh";
+  /** Device id this token was issued to (enables per-device revocation). */
+  did?: string;
+}
+
+const EXPECTED_HEADER = b64urlEncodeStatic(JSON.stringify({ alg: "HS256", typ: "JWT" }));
+
+function b64urlEncodeStatic(s: string): string {
+  return Buffer.from(s, "utf-8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 let cachedSecret: string | null = null;
@@ -51,7 +59,7 @@ function b64urlDecode(s: string): Buffer {
   return Buffer.from(b64, "base64");
 }
 
-export function signJwt(claims: { sub: string; email: string; type?: "access" | "refresh"; expiresInSec?: number }): string {
+export function signJwt(claims: { sub: string; email: string; type?: "access" | "refresh"; expiresInSec?: number; did?: string | undefined }): string {
   const nowSec = Math.floor(Date.now() / 1000);
   const type = claims.type ?? "access";
   const ttl = claims.expiresInSec ?? defaultTtl(type);
@@ -62,8 +70,9 @@ export function signJwt(claims: { sub: string; email: string; type?: "access" | 
     iat: nowSec,
     exp: nowSec + ttl,
     type,
+    ...(claims.did ? { did: claims.did } : {}),
   };
-  const header = b64urlEncode(Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" }), "utf-8"));
+  const header = EXPECTED_HEADER;
   const body = b64urlEncode(Buffer.from(JSON.stringify(payload), "utf-8"));
   const sig = b64urlEncode(createHmac("sha256", getJwtSecret()).update(`${header}.${body}`).digest());
   return `${header}.${body}.${sig}`;
@@ -78,18 +87,28 @@ export function defaultTtl(type: "access" | "refresh"): number {
   return Number.isFinite(v) && v > 0 ? v : 7 * 24 * 3600;
 }
 
-export function verifyJwt(token: string): JwtPayload | null {
+/**
+ * Verify signature + expiry. Pass `type` to also enforce the token kind
+ * (access tokens must never be accepted where a refresh token is expected,
+ * and vice versa).
+ */
+export function verifyJwt(token: string, type?: "access" | "refresh"): JwtPayload | null {
   try {
+    if (token.length > 4096) return null;
     const parts = token.split(".");
     if (parts.length !== 3) return null;
     const [header, body, sig] = parts as [string, string, string];
+    // Only our exact header is valid — rejects alg=none / alg confusion outright.
+    if (header !== EXPECTED_HEADER) return null;
     const expected = b64urlEncode(createHmac("sha256", getJwtSecret()).update(`${header}.${body}`).digest());
     const a = Buffer.from(sig, "utf-8");
     const b = Buffer.from(expected, "utf-8");
     if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
     const payload = JSON.parse(b64urlDecode(body).toString("utf-8")) as JwtPayload;
-    if (!payload.sub || !payload.exp) return null;
+    if (typeof payload.sub !== "string" || typeof payload.exp !== "number" || typeof payload.jti !== "string") return null;
     if (payload.exp * 1000 < Date.now()) return null; // expired
+    if (payload.type !== "access" && payload.type !== "refresh") return null;
+    if (type && payload.type !== type) return null;
     return payload;
   } catch {
     return null;

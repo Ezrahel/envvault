@@ -155,6 +155,7 @@ export async function backupCommand(opts: BackupOpts = {}) {
             continue;
           } catch (e) {
             console.log(chalk.yellow(`  ⚠ Cloud upload failed for ${env.fileName}: ${(e as Error).message}`));
+            if (/\b401\b/.test((e as Error).message)) console.log(chalk.yellow(`    Your session expired or this device was revoked. Run \`envvault login\` and run backup again.`));
           }
         }
 

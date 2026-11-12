@@ -152,6 +152,8 @@ export async function pushCommand(opts: PushOpts = {}) {
       } catch (e: any) {
         const cause = e.cause ? ` cause: ${e.cause.message ?? e.cause}` : "";
         console.log(chalk.yellow(`⚠ API upload failed for ${file}: ${e.message}${cause}`));
+
+        if (/\b401\b/.test(String(e?.message))) console.log(chalk.yellow(`  Your session expired or this device was revoked. Run \`envvault login\` and push again.`));
         if (process.env.DEBUG) console.log(chalk.dim(`  ${e.stack?.split("\n")[0]}`));
         console.log(chalk.dim(`  Storing locally as fallback (MVP)...`));
       }

@@ -2,6 +2,7 @@
 import { Command } from "commander";
 import chalk from "chalk";
 import { loginCommand } from "./commands/login.js";
+import { signupCommand } from "./commands/signup.js";
 import { logoutCommand } from "./commands/logout.js";
 import { scanCommand } from "./commands/scan.js";
 import { projectsCommand } from "./commands/projects.js";
@@ -28,11 +29,25 @@ program
   .version("0.1.0");
 
 program
+  .command("signup")
+  .description("Create an EnvVault account and set your vault passphrase")
+  .option("--email <email>", "account email")
+  .option("--password <password>", "account password (or ENVVAULT_PASSWORD; prompted if omitted)")
+  .action(async (opts) => {
+    try {
+      await signupCommand(opts);
+    } catch (e) {
+      console.error(chalk.red((e as Error).message));
+      process.exit(EXIT_CODES.GENERAL_ERROR);
+    }
+  });
+
+program
   .command("login")
-  .description("Authenticate via browser (GitHub OAuth preferred per spec §51)")
-  .option("--email <email>", "email for login")
-  .option("--password <password>", "password (or set ENVVAULT_PASSWORD; prompted securely if omitted)")
-  .option("--github", "Login via GitHub OAuth (recommended)")
+  .description("Log in on this machine and unlock your vault (vault passphrase: ENVVAULT_MASTER_KEY or prompt)")
+  .option("--email <email>", "account email")
+  .option("--password <password>", "account password (or ENVVAULT_PASSWORD; prompted if omitted)")
+  .option("--github", "Log in with GitHub OAuth (when enabled on the server)")
   .action(async (opts) => {
     try {
       await loginCommand(opts);

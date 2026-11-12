@@ -48,6 +48,7 @@ export function getDb(): Db | null {
       // Required for CockroachDB; harmless (slightly slower) on plain Postgres
       // and required for transaction poolers.
       prepare: false,
+      onnotice: () => {},
     });
     db = drizzle(client, { schema });
     return db;

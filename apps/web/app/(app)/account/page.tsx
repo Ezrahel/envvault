@@ -1,25 +1,43 @@
+import { KeyRound, User } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { PageHeader, Code } from "@/components/ui/page-header";
 
 export default function AccountPage() {
   return (
-    <div className="space-y-4">
-      <h1 className="text-2xl font-bold tracking-tight">Account</h1>
-      <p className="max-w-[640px] text-sm text-zinc-400">Manage your EnvVault account. Email + OAuth (GitHub first per §51) with least-privilege permissions.</p>
-      <div className="grid gap-4 max-w-[520px]">
+    <div className="space-y-6">
+      <PageHeader eyebrow="Account" title="Account" description="Email and OAuth sign-in (GitHub first) with least-privilege permissions." />
+      <div className="grid max-w-[880px] gap-4 md:grid-cols-2">
         <Card>
-          <h3 className="text-sm font-semibold">Profile</h3>
-          <p className="mt-2 text-sm text-zinc-400">Email: <code className="rounded bg-zinc-900 px-1 py-0.5 font-mono text-xs">dev@example.com</code></p>
-          <p className="mt-1 text-xs text-zinc-500">Name synced from GitHub OAuth when enabled.</p>
-          <div className="mt-3 flex gap-2">
-            <Badge>GitHub OAuth → soon</Badge>
-            <Badge>MFA → future</Badge>
+          <div className="flex items-center gap-3">
+            <span className="grid h-12 w-12 place-items-center rounded-2xl bg-gradient-to-br from-volt to-iris text-lg font-semibold text-black">A</span>
+            <div>
+              <h3 className="text-sm font-semibold">Profile</h3>
+              <p className="text-xs text-zinc-500">Synced from GitHub OAuth when enabled</p>
+            </div>
+          </div>
+          <div className="mt-5 flex items-center gap-2 rounded-xl border border-white/[0.06] bg-black/20 px-3 py-2.5 text-sm">
+            <User className="h-4 w-4 text-zinc-500" />
+            <Code>dev@example.com</Code>
+          </div>
+          <div className="mt-4 flex gap-2">
+            <Badge>GitHub OAuth · soon</Badge>
+            <Badge>MFA · future</Badge>
           </div>
         </Card>
-        <Card className="bg-zinc-900/30">
-          <h3 className="text-sm font-semibold">Recovery Model (MVP)</h3>
-          <p className="mt-2 text-xs leading-5 text-zinc-400">EnvVault uses client-side encryption. If you lose your master key, secrets cannot be recovered (Mode A — Maximum privacy). This is a deliberate tradeoff per §24. Future: encrypted key wrapping (Mode B) and team recovery keys (Mode C).</p>
-          <p className="mt-2 text-xs text-zinc-500">Authentication (OAuth token) ≠ Encryption key. Server never sees plaintext.</p>
+        <Card className="relative overflow-hidden">
+          <div aria-hidden className="absolute -right-12 -bottom-12 h-40 w-40 rounded-full bg-iris/15 blur-3xl" />
+          <div className="relative">
+            <div className="flex items-center gap-2">
+              <KeyRound className="h-4 w-4 text-volt" />
+              <h3 className="text-sm font-semibold">Recovery model</h3>
+            </div>
+            <p className="mt-3 text-xs leading-5 text-zinc-400">
+              EnvVault uses client-side encryption. If you lose your master key, secrets cannot be recovered. This is a deliberate trade-off for
+              maximum privacy. Encrypted key wrapping and team recovery keys are planned.
+            </p>
+            <p className="mt-3 text-xs text-zinc-500">Authentication token ≠ encryption key. The server never sees plaintext.</p>
+          </div>
         </Card>
       </div>
     </div>

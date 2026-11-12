@@ -140,17 +140,19 @@ describe("e2e: real temp git repo roundtrip", () => {
     const cli = path.resolve("packages/cli/dist/index.js");
     const configDir = path.join(tmp, ".envvault-cli-test");
     const envA = "DATABASE_URL=postgres://localhost\nJWT_SECRET=supersecret123\nPAYSTACK_SECRET_KEY=sk_test\n";
+    // Non-interactive: empty password skips the prompt; unreachable API forces the local-vault path.
+    const cliEnv = { ...process.env, ENVVAULT_CONFIG_DIR: configDir, ENVVAULT_PASSWORD: "", ENVVAULT_MASTER_KEY: "e2e-vault-passphrase", ENVVAULT_API_URL: "http://127.0.0.1:1" };
     await fs.writeFile(path.join(repoA, ".env"), envA);
     // login
-    await exec("node", [cli, "login", "--email", "e2e@test.com"], { env: { ...process.env, ENVVAULT_CONFIG_DIR: configDir } } as any);
+    await exec("node", [cli, "login", "--email", "e2e@test.com"], { env: cliEnv } as any);
     // push with --yes
-    await exec("node", [cli, "push", "--path", repoA, "--yes"], { env: { ...process.env, ENVVAULT_CONFIG_DIR: configDir } } as any);
+    await exec("node", [cli, "push", "--path", repoA, "--yes"], { env: cliEnv } as any);
     // Verify vault exists
     const vaultFile = path.join(configDir, "vault", "github.com/<username>/<repository>", ".env.json");
     const exists = await fs.stat(vaultFile).then(() => true).catch(() => false);
     expect(exists).toBe(true);
     // Pull to repoB (different folder, simulating new laptop / different username)
-    await exec("node", [cli, "pull", "--path", repoB, "--yes"], { env: { ...process.env, ENVVAULT_CONFIG_DIR: configDir } } as any);
+    await exec("node", [cli, "pull", "--path", repoB, "--yes"], { env: cliEnv } as any);
     const restored = await fs.readFile(path.join(repoB, ".env"), "utf-8");
     expect(restored).toBe(envA);
     // Ensure server compromise would not expose plaintext: vault file is ciphertext

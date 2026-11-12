@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -93,8 +94,8 @@ describe("DbStore via facade (PGlite)", () => {
     expect(await store.findProjectByCanonical(b.id, data.canonicalRemote)).toBeNull();
     expect(await store.getProjectById(b.id, p1.id)).toBeNull();
     expect((await store.listProjects(a.id)).map((p) => p.id)).toContain(p1.id);
-    expect(await store.deleteProject(b.id, p1.id)).toBe(false);
-    expect(await store.deleteProject(a.id, p1.id)).toBe(true);
+    expect(await store.deleteProject(b.id, p1.id)).toBeNull(); // not owner → not found
+    expect(await store.deleteProject(a.id, p1.id)).toEqual([]); // owner → deleted, no objects to purge
     expect(await store.getProjectById(a.id, p1.id)).toBeNull();
   });
 
@@ -111,21 +112,34 @@ describe("DbStore via facade (PGlite)", () => {
     expect(await store.getEnvironment(e1.id)).toMatchObject({ name: "development" });
   });
 
-  it("versions: sequencing, payload shape, lookup", async () => {
+  it("versions: sequencing, payload shape, lookup, tenant isolation", async () => {
     const u = await store.ensureUser("db-ver@example.com");
+    const other = await store.ensureUser("db-ver-other@example.com");
     const canon = "github.com/db-ver/r";
-    await store.createProject({ userId: u.id, provider: "github", host: "github.com", repository: "r", canonicalRemote: canon });
-    const base = { objectKey: "k", cipherAlgorithm: "AES-256-GCM", keyVersion: 1, nonce: "n", authTag: "t", ciphertext: "C1", canonicalRemote: canon, fileName: ".env", createdBy: u.id };
-    const v1 = await store.addVersion({ ...base, environmentName: "development" });
+    const p = await store.createProject({ userId: u.id, provider: "github", host: "github.com", repository: "r", canonicalRemote: canon });
+    const base = { userId: u.id, projectId: p.id, objectKey: "k", cipherAlgorithm: "AES-256-GCM", formatVersion: 1, keyVersion: 1, nonce: "n", authTag: "t", fileName: ".env" };
+    const v1 = await store.addVersion({ ...base, id: randomUUID(), ciphertext: "C1", environmentName: "development" });
     expect(v1.version).toBe(1);
-    const v2 = await store.addVersion({ ...base, ciphertext: "C2", environmentName: "development" });
+    const v2 = await store.addVersion({ ...base, id: randomUUID(), ciphertext: "C2", environmentName: "development" });
     expect(v2.version).toBe(2);
-    const list = await store.listVersions(canon, ".env");
+    const list = await store.listVersions(u.id, canon, ".env");
     expect(list.map((v) => v.version)).toEqual([1, 2]);
     expect(list[0]).toMatchObject({ ciphertext: "C1", authTag: "t", formatVersion: 1, canonicalRemote: canon, fileName: ".env", environmentName: "development" });
-    expect(await store.getVersionByNumber(canon, ".env", 2)).toMatchObject({ ciphertext: "C2" });
-    expect(await store.getVersionByNumber(canon, ".env", 99)).toBeNull();
-    expect(await store.listVersions(canon, "missing")).toEqual([]);
+    expect(await store.getVersionByNumber(u.id, canon, ".env", 2)).toMatchObject({ ciphertext: "C2" });
+    expect(await store.getVersionByNumber(u.id, canon, ".env", 99)).toBeNull();
+    expect(await store.listVersions(u.id, canon, "missing")).toEqual([]);
+    // Another account sees nothing for the same remote, and can't write into this project.
+    expect(await store.listVersions(other.id, canon, ".env")).toEqual([]);
+    await expect(store.addVersion({ ...base, userId: other.id, id: randomUUID(), ciphertext: "EVIL", environmentName: "development" })).rejects.toThrow();
+    expect((await store.listVersions(u.id, canon, ".env")).map((v) => v.ciphertext)).toEqual(["C1", "C2"]);
+  });
+
+  it("concurrent pushes get distinct, gap-free version numbers", async () => {
+    const u = await store.ensureUser("db-race@example.com");
+    const p = await store.createProject({ userId: u.id, provider: "github", host: "github.com", repository: "r", canonicalRemote: "github.com/db-race/r" });
+    const base = { userId: u.id, projectId: p.id, objectKey: "k", cipherAlgorithm: "AES-256-GCM", formatVersion: 1, keyVersion: 1, nonce: "n", fileName: ".env", environmentName: "local" };
+    const results = await Promise.all(Array.from({ length: 6 }, (_, i) => store.addVersion({ ...base, id: randomUUID(), ciphertext: `C${i}` })));
+    expect(results.map((r) => r.version).sort((a, b) => a - b)).toEqual([1, 2, 3, 4, 5, 6]);
   });
 
   it("revocation + devices roundtrip", async () => {
@@ -135,7 +149,10 @@ describe("DbStore via facade (PGlite)", () => {
     const u = await store.ensureUser("db-dev@example.com");
     const d = await store.registerDevice(u.id, "laptop", "linux");
     expect((await store.listDevices(u.id)).map((x) => x.id)).toContain(d.id);
-    await store.revokeDevice(d.id);
+    const stranger = await store.ensureUser("db-dev-stranger@example.com");
+    expect(await store.revokeDevice(stranger.id, d.id)).toBe(false); // not theirs
+    expect((await store.listDevices(u.id)).map((x) => x.id)).toContain(d.id);
+    expect(await store.revokeDevice(u.id, d.id)).toBe(true);
     expect(await store.listDevices(u.id)).toEqual([]);
   });
 

@@ -9,7 +9,15 @@ export interface AuthState {
   userId?: string;
   email?: string;
   deviceId?: string;
-  masterKey?: string; // For MVP: derived encryption secret stored locally. In prod use keychain.
+  refreshToken?: string;
+  /** Vault key (hex) derived from the vault passphrase — see crypto/vaultKey.ts. Never sent anywhere. */
+  masterKey?: string;
+  /** How masterKey was produced. "passphrase-v1" = portable across machines. */
+  keyScheme?: string;
+  /** Keys from earlier logins on this machine; tried for decryption only. */
+  legacyMasterKeys?: string[];
+  /** True when the API was unreachable at login (local vault only). */
+  offline?: boolean;
 }
 
 export function getAuthFilePath(): string {
@@ -33,9 +41,7 @@ export async function saveAuth(state: AuthState): Promise<void> {
   try {
     await fs.chmod(p, 0o600);
   } catch {}
-  if (state.masterKey) {
-    console.warn("⚠ Master key stored in plaintext fallback file. Use OS keychain in production.");
-  }
+
 }
 
 export async function clearAuth(): Promise<void> {

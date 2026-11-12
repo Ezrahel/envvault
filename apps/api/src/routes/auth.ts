@@ -1,277 +1,233 @@
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { store } from "../lib/store.js";
 import { auditLog } from "../lib/audit.js";
 import { signJwt, verifyJwt } from "../lib/jwt.js";
 import { hashPassword, verifyPassword } from "../lib/password.js";
+import { authenticate, bearer, requireUser, resolveToken } from "../lib/auth.js";
+import { emailSchema, uuidParam, zodMessage } from "../lib/validate.js";
+
+const deviceFields = {
+  deviceName: z.string().trim().min(1).max(255).optional(),
+  platform: z.string().trim().max(50).optional(),
+};
 
 const registerSchema = z.object({
-  email: z.string().email(),
+  email: emailSchema,
   password: z.string().min(8).max(128),
-  name: z.string().optional(),
-  deviceName: z.string().optional(),
-  platform: z.string().optional(),
+  name: z.string().trim().max(200).optional(),
+  ...deviceFields,
 });
 
 const loginSchema = z.object({
-  email: z.string().email(),
-  // Optional for backward compat (older CLI + existing tests send email only).
-  // Required in production for accounts that have a password set.
+  email: emailSchema,
+  // Optional only so dev/test passwordless login keeps working; required in production.
   password: z.string().min(1).max(128).optional(),
-  name: z.string().optional(),
-  deviceName: z.string().optional(),
-  platform: z.string().optional(),
+  name: z.string().trim().max(200).optional(),
+  ...deviceFields,
 });
 
 const githubSchema = z.object({
-  email: z.string().email().optional(),
-  githubUser: z.string().min(1).optional(),
+  code: z.string().min(1).max(512).optional(),
+  // Dev mock only — ignored when real OAuth is configured.
+  email: emailSchema.optional(),
+  githubUser: z.string().min(1).max(39).optional(),
   provider: z.literal("github").optional(),
-  deviceName: z.string().optional(),
-  platform: z.string().optional(),
-  // Real OAuth: frontend/CLI exchanges via GitHub then sends the code.
-  code: z.string().min(1).optional(),
+  ...deviceFields,
 });
 
-function isProd(): boolean {
-  return process.env.NODE_ENV === "production";
+const refreshSchema = z.object({ refreshToken: z.string().min(10).max(4096).optional() }).passthrough();
+
+const isProd = () => process.env.NODE_ENV === "production";
+const GH_LOGIN = /^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,38})$/;
+
+// A fixed, valid hash so login does equal work whether or not the email exists.
+let dummyHash: string | null = null;
+const getDummyHash = () => (dummyHash ??= hashPassword("timing-equalizer-not-a-password"));
+
+const INVALID_CREDENTIALS = "Invalid email or password";
+
+async function issuePair(user: { id: string; email: string }, req: FastifyRequest, device?: { deviceName?: string | undefined; platform?: string | undefined }) {
+  let did: string | undefined;
+  if (device?.deviceName) {
+    const d = await store.registerDevice(user.id, device.deviceName, device.platform ?? String(req.headers["user-agent"] ?? "unknown").slice(0, 50));
+    did = d.id;
+  }
+  const token = signJwt({ sub: user.id, email: user.email, type: "access", did });
+  const refreshToken = signJwt({ sub: user.id, email: user.email, type: "refresh", did });
+  return { token, refreshToken, ...(did ? { deviceId: did } : {}) };
 }
 
-function issuePair(user: { id: string; email: string }) {
-  const token = signJwt({ sub: user.id, email: user.email, type: "access" });
-  const refreshToken = signJwt({ sub: user.id, email: user.email, type: "refresh" });
-  return { token, refreshToken };
+async function githubIdentity(code: string, clientId: string, clientSecret: string): Promise<{ login: string; id: number; email: string } | null> {
+  const ctl = AbortSignal.timeout(10_000);
+  const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ client_id: clientId, client_secret: clientSecret, code }),
+    signal: ctl,
+  });
+  if (!tokenRes.ok) return null;
+  const { access_token } = (await tokenRes.json()) as { access_token?: string };
+  if (!access_token) return null;
+  const headers = { Authorization: `Bearer ${access_token}`, "User-Agent": "envvault", Accept: "application/vnd.github+json" };
+  const userRes = await fetch("https://api.github.com/user", { headers, signal: ctl });
+  if (!userRes.ok) return null;
+  const gh = (await userRes.json()) as { login?: string; id?: number };
+  if (!gh.login || !GH_LOGIN.test(gh.login) || typeof gh.id !== "number") return null;
+  // Only a *verified primary* email may identify an account (needs `user:email` scope).
+  let email: string | undefined;
+  const emailsRes = await fetch("https://api.github.com/user/emails", { headers, signal: ctl });
+  if (emailsRes.ok) {
+    const emails = (await emailsRes.json()) as Array<{ email: string; primary: boolean; verified: boolean }>;
+    email = emails.find((e) => e.primary && e.verified)?.email;
+  }
+  // No verified email → a stable, unclaimable noreply identity tied to the GitHub user id.
+  return { login: gh.login, id: gh.id, email: (email ?? `${gh.id}+${gh.login}@users.noreply.github.com`).toLowerCase() };
 }
 
 export async function authRoutes(app: FastifyInstance) {
-  // Register — the production path. Creates the account with a scrypt-hashed password.
-  app.post("/register", async (req, reply) => {
-    const body = registerSchema.safeParse((req as any).body);
-    if (!body.success) return reply.status(400).send({ error: body.error.message });
+  // Stricter per-IP limit on credential endpoints (no-op if rate limiting isn't registered).
+  const authLimit = { config: { rateLimit: { max: Number(process.env.AUTH_RATE_LIMIT_MAX ?? 10), timeWindow: "1 minute" } } };
+
+  app.post("/register", authLimit, async (req, reply) => {
+    const body = registerSchema.safeParse(req.body);
+    if (!body.success) return reply.status(400).send({ error: zodMessage(body.error) });
     const { email, password, name, deviceName, platform } = body.data;
 
-    const existing = await store.getUserByEmail(email);
-    if (existing?.passwordHash) {
-      return reply.status(409).send({ error: "Account already exists. Log in instead." });
-    }
-    const user = await store.ensureUser(email, name);
-    await store.setPasswordHash(user.id, hashPassword(password));
-    if (deviceName) {
-      await store.registerDevice(user.id, deviceName, platform ?? (req.headers["user-agent"] as string) ?? "unknown");
-    }
-    const pair = issuePair(user);
-    await auditLog(req as any, "auth.register", { userId: user.id });
-    app.log.info({ event: "auth.register", userId: user.id }, "register");
+    // Any existing account (including passwordless GitHub accounts) blocks registration —
+    // otherwise registering would let a stranger claim someone else's account.
+    const user = await store.createUserWithPassword(email, hashPassword(password), name);
+    if (!user) return reply.status(409).send({ error: "An account with this email already exists. Log in instead." });
+
+    const pair = await issuePair(user, req, { deviceName, platform });
+    await auditLog(req, "auth.register", { userId: user.id, deviceId: pair.deviceId });
     reply.status(201);
     return { ...pair, userId: user.id, email: user.email };
   });
 
-  app.post("/login", async (req, reply) => {
-    const body = loginSchema.safeParse((req as any).body);
-    if (!body.success) return reply.status(400).send({ error: body.error.message });
+  app.post("/login", authLimit, async (req, reply) => {
+    const body = loginSchema.safeParse(req.body);
+    if (!body.success) return reply.status(400).send({ error: zodMessage(body.error) });
     const { email, password, name, deviceName, platform } = body.data;
 
     let user = await store.getUserByEmail(email);
-    if (!user) {
-      if (isProd()) {
-        return reply.status(401).send({ error: "Account not found. Register first." });
+
+    if (isProd()) {
+      if (!password) return reply.status(401).send({ error: INVALID_CREDENTIALS });
+      const ok = verifyPassword(password, user?.passwordHash ?? getDummyHash());
+      // Unknown email, passwordless account, or wrong password: same answer, same work.
+      if (!user || !user.passwordHash || !ok) {
+        await auditLog(req, "auth.login_failed", user ? { userId: user.id } : {});
+        return reply.status(401).send({ error: INVALID_CREDENTIALS });
       }
-      // Dev/test: preserve legacy auto-provisioning (existing tests + frictionless onboarding).
-      user = await store.ensureUser(email, name);
-    } else if (name && !user.name) {
-      user = await store.ensureUser(email, name);
-    }
-
-    if (user.passwordHash) {
-      if (!password || !verifyPassword(password, user.passwordHash)) {
-        return reply.status(401).send({ error: "Invalid email or password" });
+    } else {
+      // Dev/test: auto-provision and allow passwordless login for frictionless local use.
+      if (!user) user = await store.ensureUser(email, name);
+      if (user.passwordHash) {
+        if (!password || !verifyPassword(password, user.passwordHash)) return reply.status(401).send({ error: INVALID_CREDENTIALS });
+      } else if (password) {
+        await store.setPasswordHash(user.id, hashPassword(password));
       }
-    } else if (password) {
-      // Upgrade path: set a password on a legacy passwordless account.
-      await store.setPasswordHash(user.id, hashPassword(password));
-    } else if (isProd()) {
-      return reply.status(401).send({ error: "Password required. Set one via login with a password once, or register." });
     }
 
-    // Device registration per §31 devices table
-    if (deviceName) {
-      await store.registerDevice(user.id, deviceName, platform ?? (req.headers["user-agent"] as string) ?? "unknown");
-    }
-
-    const pair = issuePair(user);
-    await auditLog(req as any, "auth.login", { userId: user.id });
-    app.log.info({ event: "auth.login", userId: user.id }, "login");
-    return { ...pair, userId: user.id, email: user.email, name: name ?? user.name ?? user.email };
+    const pair = await issuePair(user, req, { deviceName, platform });
+    await auditLog(req, "auth.login", { userId: user.id, deviceId: pair.deviceId });
+    return { ...pair, userId: user.id, email: user.email, name: user.name ?? name ?? user.email };
   });
 
-  // GitHub OAuth per spec §51 — least privilege, repository identity verification.
-  // Real flow (when GITHUB_CLIENT_ID/SECRET are set and a `code` is provided):
-  //   code → github.com/login/oauth/access_token → api.github.com/user (verified login + id).
-  // Dev/MVP fallback (no secrets): email + githubUser mock, as before.
-  app.post("/github", async (req, reply) => {
-    const body = githubSchema.safeParse((req as any).body);
-    if (!body.success) return reply.status(400).send({ error: body.error.message });
-    const { email, githubUser, deviceName, platform, code } = body.data;
-
+  // GitHub OAuth: code → access token → GitHub user + verified primary email.
+  app.post("/github", authLimit, async (req, reply) => {
+    const body = githubSchema.safeParse(req.body);
+    if (!body.success) return reply.status(400).send({ error: zodMessage(body.error) });
+    const { code, email, githubUser, deviceName, platform } = body.data;
     const clientId = process.env.GITHUB_CLIENT_ID;
     const clientSecret = process.env.GITHUB_CLIENT_SECRET;
-    if (code && clientId && clientSecret) {
+
+    if (clientId && clientSecret) {
+      if (!code) return reply.status(400).send({ error: "Missing OAuth code" });
+      let gh: Awaited<ReturnType<typeof githubIdentity>>;
       try {
-        const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Accept: "application/json" },
-          body: JSON.stringify({ client_id: clientId, client_secret: clientSecret, code }),
-        });
-        if (!tokenRes.ok) return reply.status(502).send({ error: "GitHub token exchange failed" });
-        const tokenData = (await tokenRes.json()) as { access_token?: string; error?: string };
-        if (!tokenData.access_token) {
-          return reply.status(502).send({ error: `GitHub token exchange failed: ${tokenData.error ?? "unknown"}` });
-        }
-        const userRes = await fetch("https://api.github.com/user", {
-          headers: { Authorization: `Bearer ${tokenData.access_token}`, "User-Agent": "envvault" },
-        });
-        if (!userRes.ok) return reply.status(502).send({ error: "GitHub user fetch failed" });
-        const gh = (await userRes.json()) as { login: string; id: number; email?: string | null };
-        if (!/^[a-zA-Z0-9-]+$/.test(gh.login)) {
-          return reply.status(502).send({ error: "Invalid GitHub username" });
-        }
-        const resolvedEmail = email ?? gh.email ?? `${gh.login}@users.noreply.github.com`;
-        const user = await store.ensureUser(resolvedEmail);
-        await auditLog(req as any, "auth.github_login", { userId: user.id });
-        app.log.info({ event: "auth.github_login", githubUser: gh.login, userId: user.id }, "github login");
-        if (deviceName) {
-          await store.registerDevice(user.id, deviceName, platform ?? "github-oauth");
-        }
-        const pair = issuePair(user);
-        return { ...pair, userId: user.id, email: resolvedEmail, githubUser: gh.login, provider: "github" };
+        gh = await githubIdentity(code, clientId, clientSecret);
       } catch (e) {
-        req.log.error({ err: e }, "github oauth failed");
+        req.log.warn({ err: (e as Error).message }, "github oauth failed");
         return reply.status(502).send({ error: "GitHub OAuth failed" });
       }
+      if (!gh) return reply.status(401).send({ error: "GitHub OAuth failed" });
+      const user = await store.ensureUser(gh.email);
+      const pair = await issuePair(user, req, { deviceName, platform: platform ?? "github-oauth" });
+      await auditLog(req, "auth.github_login", { userId: user.id, deviceId: pair.deviceId });
+      return { ...pair, userId: user.id, email: user.email, githubUser: gh.login, provider: "github" };
     }
 
     if (isProd()) {
-      return reply.status(501).send({
-        error: "GitHub OAuth not configured. Set GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET and send an OAuth code.",
-      });
+      return reply.status(501).send({ error: "GitHub OAuth is not configured on this server." });
     }
-    // Dev/MVP mock (preserves existing CLI/tests behavior).
-    if (!email || !githubUser) {
-      return reply.status(400).send({ error: "email and githubUser are required in dev mock mode" });
-    }
-    if (!/^[a-zA-Z0-9-]+$/.test(githubUser)) {
-      return reply.status(400).send({ error: "Invalid GitHub username" });
+    // Dev mock (no OAuth app configured).
+    if (!email || !githubUser || !GH_LOGIN.test(githubUser)) {
+      return reply.status(400).send({ error: "email and a valid githubUser are required in dev mock mode" });
     }
     const user = await store.ensureUser(email);
-    await auditLog(req as any, "auth.github_login", { userId: user.id });
-    app.log.info({ event: "auth.github_login", email, githubUser, userId: user.id }, "github login");
-    if (deviceName) {
-      await store.registerDevice(user.id, deviceName, platform ?? "github-oauth");
-    }
-    const pair = issuePair(user);
-    return { ...pair, userId: user.id, email, githubUser, provider: "github" };
+    const pair = await issuePair(user, req, { deviceName, platform: platform ?? "github-oauth" });
+    await auditLog(req, "auth.github_login", { userId: user.id, deviceId: pair.deviceId });
+    return { ...pair, userId: user.id, email: user.email, githubUser, provider: "github" };
   });
 
-  // OAuth callback placeholder for browser flow (spec §51 GitHub integration)
+  // Browser OAuth redirect target: hands the code to the client; exchange happens via POST /github.
   app.get("/github/callback", async (req, reply) => {
-    const { code, state } = (req as any).query as { code?: string; state?: string };
-    if (!code) return reply.status(400).send({ error: "Missing OAuth code. In production, redirect to GitHub OAuth." });
-    // Exchange happens in POST /v1/auth/github with { code } when server is configured.
-    return { message: "GitHub OAuth callback received. Exchange the code via POST /v1/auth/github.", code, state };
+    const q = z.object({ code: z.string().min(1).max(512), state: z.string().max(512).optional() }).safeParse(req.query);
+    if (!q.success) return reply.status(400).send({ error: "Missing OAuth code" });
+    reply.header("Cache-Control", "no-store");
+    return { message: "Exchange this code via POST /v1/auth/github.", code: q.data.code, state: q.data.state };
   });
 
-  app.post("/logout", async (req, reply) => {
-    const auth = req.headers.authorization;
-    const bodyRefresh = ((req as any).body as { refreshToken?: string } | undefined)?.refreshToken;
-    if (auth) {
-      const token = auth.slice(7);
-      if (token.split(".").length === 3) {
-        const payload = verifyJwt(token);
-        if (payload) await store.revokeJti(payload.jti);
-      } else {
-        await store.revokeToken(token);
+  app.post("/logout", async (req) => {
+    const access = bearer(req);
+    const refreshToken = refreshSchema.safeParse(req.body ?? {}).data?.refreshToken;
+    let userId: string | undefined;
+    for (const t of [access, refreshToken]) {
+      if (!t) continue;
+      const p = verifyJwt(t);
+      if (p) {
+        userId = p.sub;
+        await store.revokeJti(p.jti, p.sub, p.exp);
       }
-      await auditLog(req as any, "auth.logout");
     }
-    if (bodyRefresh) {
-      const payload = verifyJwt(bodyRefresh);
-      if (payload) await store.revokeJti(payload.jti);
-    }
+    if (userId) await auditLog(req, "auth.logout", { userId });
     return { ok: true };
   });
 
-  app.post("/refresh", async (req, reply) => {
-    const bodyToken = ((req as any).body as { refreshToken?: string } | undefined)?.refreshToken;
-    const auth = req.headers.authorization;
-    const incoming = bodyToken ?? (auth ? auth.slice(7) : undefined);
-    if (!incoming) return reply.status(401).send({ error: "No token" });
-
-    // JWT path: rotate (revoke presented token, issue fresh pair).
-    if (incoming.split(".").length === 3) {
-      const payload = verifyJwt(incoming);
-      if (!payload) return reply.status(401).send({ error: "Invalid token" });
-      if (await store.isJtiRevoked(payload.jti)) return reply.status(401).send({ error: "Invalid token" });
-      const user = await store.getUserByEmail(payload.email);
-      if (!user || user.id !== payload.sub) return reply.status(401).send({ error: "Invalid token" });
-      await store.revokeJti(payload.jti);
-      const pair = issuePair(user);
-      return pair;
-    }
-
-    // Legacy opaque path (older clients).
-    const newToken = await store.rotateToken(incoming);
-    if (!newToken) return reply.status(401).send({ error: "Invalid token" });
-    return { token: newToken };
+  // Rotate: a refresh token is single-use; presenting it yields a fresh pair bound to the same device.
+  app.post("/refresh", authLimit, async (req, reply) => {
+    const parsed = refreshSchema.safeParse(req.body ?? {});
+    const incoming = parsed.data?.refreshToken ?? bearer(req);
+    if (!incoming) return reply.status(401).send({ error: "Invalid token" });
+    const resolved = await resolveToken(incoming, "refresh");
+    if (!resolved) return reply.status(401).send({ error: "Invalid token" });
+    await store.revokeJti(resolved.payload.jti, resolved.user.id, resolved.payload.exp);
+    const did = resolved.payload.did;
+    return {
+      token: signJwt({ sub: resolved.user.id, email: resolved.user.email, type: "access", did }),
+      refreshToken: signJwt({ sub: resolved.user.id, email: resolved.user.email, type: "refresh", did }),
+    };
   });
 
-  app.get("/me", async (req, reply) => {
-    const h = req.headers.authorization;
-    if (!h) return reply.status(401).send({ error: "Unauthorized" });
-    const token = h.slice(7);
-    if (token.split(".").length === 3) {
-      const payload = verifyJwt(token);
-      if (!payload || (await store.isJtiRevoked(payload.jti))) {
-        return reply.status(401).send({ error: "Invalid token" });
-      }
-      const user = await store.getUserByEmail(payload.email);
-      if (!user || user.id !== payload.sub) return reply.status(401).send({ error: "Invalid token" });
-      return { userId: user.id, email: user.email };
-    }
-    const user = await store.getUserByToken(token);
-    if (!user) return reply.status(401).send({ error: "Invalid token" });
-    return { userId: user.id, email: user.email };
+  app.get("/me", { preHandler: [authenticate] }, async (req) => {
+    const u = requireUser(req);
+    return { userId: u.id, email: u.email, deviceId: u.deviceId };
   });
 
-  // Device management per spec §31
-  app.get("/devices", async (req, reply) => {
-    const auth = req.headers.authorization;
-    if (!auth) return reply.status(401).send({ error: "Unauthorized" });
-    const token = auth.slice(7);
-    const user = await resolveUser(token);
-    if (!user) return reply.status(401).send({ error: "Invalid token" });
-    return store.listDevices(user.id);
+  app.get("/devices", { preHandler: [authenticate] }, async (req) => {
+    const u = requireUser(req);
+    return store.listDevices(u.id);
   });
 
-  app.delete("/devices/:id", async (req, reply) => {
-    const auth = req.headers.authorization;
-    if (!auth) return reply.status(401).send({ error: "Unauthorized" });
-    const token = auth.slice(7);
-    const user = await resolveUser(token);
-    if (!user) return reply.status(401).send({ error: "Invalid token" });
-    const { id } = (req as any).params;
-    await store.revokeDevice(id);
-    await auditLog(req as any, "device.revoke", { userId: user.id, deviceId: id });
+  app.delete("/devices/:id", { preHandler: [authenticate] }, async (req, reply) => {
+    const u = requireUser(req);
+    const p = uuidParam.safeParse(req.params);
+    if (!p.success) return reply.status(404).send({ error: "Device not found" });
+    const ok = await store.revokeDevice(u.id, p.data.id);
+    if (!ok) return reply.status(404).send({ error: "Device not found" });
+    await auditLog(req, "device.revoke", { userId: u.id, deviceId: p.data.id });
     return { ok: true };
   });
-}
-
-async function resolveUser(token: string): Promise<{ id: string; email: string } | null> {
-  if (token.split(".").length === 3) {
-    const payload = verifyJwt(token);
-    if (!payload || (await store.isJtiRevoked(payload.jti))) return null;
-    const user = await store.getUserByEmail(payload.email);
-    if (!user || user.id !== payload.sub) return null;
-    return user;
-  }
-  return store.getUserByToken(token);
 }

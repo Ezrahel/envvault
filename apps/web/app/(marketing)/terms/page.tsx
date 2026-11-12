@@ -1,34 +1,41 @@
-import { Card } from "@/components/ui/card";
+import { DocShell, DocSection } from "@/components/site/doc-shell";
+import { Code } from "@/components/ui/page-header";
 
 export default function TermsPage() {
   return (
-    <div className="mx-auto max-w-[720px] space-y-6">
-      <h1 className="text-3xl font-bold tracking-tight">Terms of Service</h1>
-      <p className="text-sm text-zinc-400">Last updated: August 2026</p>
-      <Card>
-        <h3 className="font-semibold">1. Service</h3>
-        <p className="mt-2 text-sm text-zinc-400">EnvVault provides project-aware encrypted backup/restore for <code className="bg-zinc-900 px-1 rounded">.env</code> files. CLI is core; web manages metadata, not plaintext. Free/Pro/Team tiers per pricing.</p>
-      </Card>
-      <Card>
-        <h3 className="font-semibold">2. Acceptable use</h3>
-        <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-zinc-400">
-          <li>No abuse of rate limits (100/min, higher for migration with auth)</li>
-          <li>No attempt to decrypt others’ ciphertext</li>
-          <li>Private repos: ensure you have right to backup env</li>
-        </ul>
-      </Card>
-      <Card>
-        <h3 className="font-semibold">3. No warranty / Limitation</h3>
-        <p className="mt-2 text-sm text-zinc-400">Recovery Mode A: if you lose master key, secrets are unrecoverable by design. Backups are provided as-is. RPO 24h / RTO 4h targets (improved over time).</p>
-      </Card>
-      <Card>
-        <h3 className="font-semibold">4. Termination</h3>
-        <p className="text-sm text-zinc-400">We may revoke devices/tokens for abuse. You may `logout` and delete vault via `env delete` (type DELETE).</p>
-      </Card>
-      <Card>
-        <h3 className="font-semibold">Contact</h3>
-        <p className="text-sm text-zinc-400"><code className="bg-zinc-900 px-1 rounded">legal@yourdomain</code> • <code className="bg-zinc-900 px-1 rounded">support@yourdomain</code></p>
-      </Card>
-    </div>
+    <DocShell eyebrow="Terms of service" title="The fine print, kept short." lead="Last updated: August 2026">
+      <div className="space-y-4">
+        <DocSection n="01" title="Service">
+          <p>
+            EnvVault provides project-aware, encrypted backup and restore for <Code>.env</Code> files. The CLI is the core; the web app manages
+            metadata, never plaintext. Free, Pro and Team tiers are described on the pricing page.
+          </p>
+        </DocSection>
+        <DocSection n="02" title="Acceptable use">
+          <ul className="space-y-1.5">
+            <li><span>Don&apos;t abuse rate limits (100/min; higher for authenticated migrations).</span></li>
+            <li><span>Don&apos;t attempt to decrypt anyone else&apos;s ciphertext.</span></li>
+            <li><span>For private repos, make sure you have the right to back up their environment.</span></li>
+          </ul>
+        </DocSection>
+        <DocSection n="03" title="No warranty / limitation">
+          <p>
+            Recovery Mode A: if you lose your master key, secrets are unrecoverable by design. Backups are provided as-is, with RPO 24h / RTO 4h
+            targets that will improve over time.
+          </p>
+        </DocSection>
+        <DocSection n="04" title="Termination">
+          <p>
+            We may revoke devices or tokens for abuse. You may <Code>logout</Code> and delete your vault with <Code>env delete</Code> (type DELETE to
+            confirm).
+          </p>
+        </DocSection>
+        <DocSection n="05" title="Contact">
+          <p>
+            <Code>legal@yourdomain</Code> · <Code>support@yourdomain</Code>
+          </p>
+        </DocSection>
+      </div>
+    </DocShell>
   );
 }

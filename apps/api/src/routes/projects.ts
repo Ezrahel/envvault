@@ -1,63 +1,50 @@
 import type { FastifyInstance } from "fastify";
-import { z } from "zod";
 import { authenticate, requireUser } from "../lib/auth.js";
 import { store } from "../lib/store.js";
 import { auditLog } from "../lib/audit.js";
-
-const createProjectSchema = z.object({
-  provider: z.string().min(1),
-  host: z.string().min(1),
-  owner: z.string().optional(),
-  repository: z.string().min(1),
-  canonicalRemote: z.string().min(1),
-});
+import { getStorage } from "../lib/storage.js";
+import { projectIdentitySchema, uuidParam, zodMessage } from "../lib/validate.js";
 
 export async function projectRoutes(app: FastifyInstance) {
-  // List projects — scoped to authenticated user per §69 (never trust client projectId)
-  app.get("/projects", { preHandler: [authenticate] }, async (req) => {
+  // Every route here is authenticated and scoped to the caller (never trust a client-supplied owner).
+  app.addHook("preHandler", authenticate);
+
+  app.get("/projects", async (req) => {
     const user = requireUser(req);
     return store.listProjects(user.id);
   });
 
-  // Create project — idempotent on (userId, canonicalRemote) per §31 unique constraint
-  app.post("/projects", { preHandler: [authenticate] }, async (req, reply) => {
+  // Idempotent on (userId, canonicalRemote).
+  app.post("/projects", async (req, reply) => {
     const user = requireUser(req);
-    const parsed = createProjectSchema.safeParse((req as any).body);
-    if (!parsed.success) return reply.status(400).send({ error: parsed.error.message });
+    const parsed = projectIdentitySchema.safeParse(req.body);
+    if (!parsed.success) return reply.status(400).send({ error: zodMessage(parsed.error) });
 
     const existing = await store.findProjectByCanonical(user.id, parsed.data.canonicalRemote);
     if (existing) return existing;
-
-    const proj = await store.createProject({
-      userId: user.id,
-      provider: parsed.data.provider,
-      host: parsed.data.host,
-      owner: parsed.data.owner,
-      repository: parsed.data.repository,
-      canonicalRemote: parsed.data.canonicalRemote,
-    });
-
-    await auditLog(req as any, "project.create", { userId: user.id, projectId: proj.id });
-    app.log.info({ event: "project.create", projectId: proj.id, userId: user.id }, "project created");
+    const proj = await store.createProject({ userId: user.id, ...parsed.data });
+    await auditLog(req, "project.create", { projectId: proj.id });
     reply.status(201);
     return proj;
   });
 
-  app.get("/projects/:id", { preHandler: [authenticate] }, async (req, reply) => {
+  app.get("/projects/:id", async (req, reply) => {
     const user = requireUser(req);
-    const { id } = (req as any).params;
-    const proj = await store.getProjectById(user.id, id);
+    const p = uuidParam.safeParse(req.params);
+    const proj = p.success ? await store.getProjectById(user.id, p.data.id) : null;
     if (!proj) return reply.status(404).send({ error: "Project not found" });
     return proj;
   });
 
-  app.delete("/projects/:id", { preHandler: [authenticate] }, async (req, reply) => {
+  app.delete("/projects/:id", async (req, reply) => {
     const user = requireUser(req);
-    const { id } = (req as any).params;
-    const ok = await store.deleteProject(user.id, id);
-    if (!ok) return reply.status(404).send({ error: "Project not found" });
-    await auditLog(req as any, "project.delete", { userId: user.id, projectId: id });
-    app.log.info({ event: "project.delete", projectId: id, userId: user.id }, "project deleted");
-    return { ok: true };
+    const p = uuidParam.safeParse(req.params);
+    const keys = p.success ? await store.deleteProject(user.id, p.data.id) : null;
+    if (!keys) return reply.status(404).send({ error: "Project not found" });
+    // Purge ciphertext objects too — deleting a project means the data is gone.
+    const storage = getStorage();
+    await Promise.allSettled(keys.map((k) => storage.deleteObject(k)));
+    await auditLog(req, "project.delete");
+    return { ok: true, purgedObjects: keys.length };
   });
 }

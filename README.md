@@ -47,7 +47,9 @@ pnpm --filter @envvault/web build
 ```bash
 npm install -g envvault
 envvault init                          # → ~/.config/envvault/config.json
-envvault login --email you@example.com # or --github (OAuth, §51)
+envvault signup                        # account password + vault passphrase (first machine)
+envvault login                         # on every other machine: same vault passphrase
+                                       # CI/scripts: ENVVAULT_PASSWORD + ENVVAULT_MASTER_KEY
 envvault scan --path ~/Projects        # discover + Git identity
 envvault status                        # current repo + env files
 envvault push --yes                    # encrypt + upload (per-repo)

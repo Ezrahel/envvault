@@ -1,16 +1,15 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { randomUUID } from "node:crypto";
 import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 /**
- * Object Storage abstraction — per spec §67-68
- * Production: private R2/S3 bucket, no public access, encryption at rest, lifecycle, versioning, short-lived signed URLs
- * MVP: local filesystem fallback under data/object-storage with same objectKey scheme
+ * Object storage for ciphertext envelopes.
+ * Production: private Cloudflare R2 bucket (encrypted at rest by R2), short-lived signed URLs.
+ * Fallback: local filesystem under data/object-storage with the same key scheme.
  *
- * Object key: users/{userId}/projects/{projectId}/environments/{environmentId}/versions/{versionId}
- * Never place secret values in object names — we use IDs only.
+ * Key: users/{userId}/projects/{projectId}/environments/{environmentName}/versions/{versionId}
+ * All segments are UUIDs or charset-validated names — never secret values.
  */
 
 export interface StorageProvider {
@@ -20,38 +19,54 @@ export interface StorageProvider {
   deleteObject(key: string): Promise<void>;
 }
 
+const SAFE_SEGMENT = /^[A-Za-z0-9._-]+$/;
+
+/** A key is acceptable only if every segment is a plain name (no `..`, no empty segments). */
+export function isSafeKey(key: string): boolean {
+  if (!key || key.length > 1024 || key.startsWith("/")) return false;
+  return key.split("/").every((seg) => SAFE_SEGMENT.test(seg) && seg !== "." && seg !== "..");
+}
+
+/** True if `key` is safe and inside the caller's own prefix. */
+export function isOwnedKey(key: string, userId: string): boolean {
+  return isSafeKey(key) && key.startsWith(`users/${userId}/`);
+}
+
 class LocalStorage implements StorageProvider {
   private baseDir: string;
 
-  constructor(baseDir = path.join(process.cwd(), "data", "object-storage")) {
-    this.baseDir = baseDir;
+  constructor(baseDir = process.env.LOCAL_STORAGE_DIR ?? path.join(process.cwd(), "data", "object-storage")) {
+    this.baseDir = path.resolve(baseDir);
   }
 
   private resolveKey(key: string): string {
-    // Prevent path traversal
-    const safe = key.replace(/\.\./g, "").replace(/^\/+/, "");
-    return path.join(this.baseDir, safe);
+    if (!isSafeKey(key)) throw Object.assign(new Error("Invalid object key"), { statusCode: 400 });
+    const full = path.resolve(this.baseDir, key);
+    if (!full.startsWith(this.baseDir + path.sep)) throw Object.assign(new Error("Invalid object key"), { statusCode: 400 });
+    return full;
   }
 
   async putObject(key: string, data: Buffer): Promise<void> {
     const full = this.resolveKey(key);
-    await fs.mkdir(path.dirname(full), { recursive: true });
-    await fs.writeFile(full, data);
+    await fs.mkdir(path.dirname(full), { recursive: true, mode: 0o700 });
+    const tmp = `${full}.${process.pid}.tmp`;
+    await fs.writeFile(tmp, data, { mode: 0o600 });
+    await fs.rename(tmp, full);
   }
 
   async getObject(key: string): Promise<Buffer | null> {
     try {
       return await fs.readFile(this.resolveKey(key));
-    } catch {
-      return null;
+    } catch (e: any) {
+      if (e?.code === "ENOENT" || e?.statusCode === 400) return null;
+      throw e;
     }
   }
 
-  async generateSignedUrl(key: string, expiresInSeconds = 900): Promise<string> {
-    // For local, return a mock signed URL that would be validated by API in prod
-    // In prod this would be S3 getSignedUrl with SigV4
-    const expiresAt = Date.now() + expiresInSeconds * 1000;
-    return `http://localhost:3001/v1/storage/signed/${encodeURIComponent(key)}?expires=${expiresAt}&sig=mock_${randomUUID().slice(0, 8)}`;
+  async generateSignedUrl(key: string): Promise<string> {
+    // Local mode has no presigner: point at the authenticated download route instead.
+    const base = (process.env.PUBLIC_API_URL ?? `http://localhost:${process.env.PORT ?? 3001}`).replace(/\/+$/, "");
+    return `${base}/v1/storage/signed/${encodeURIComponent(key)}`;
   }
 
   async deleteObject(key: string): Promise<void> {
@@ -62,74 +77,66 @@ class LocalStorage implements StorageProvider {
 }
 
 class R2Storage implements StorageProvider {
-  // Cloudflare R2 / S3-compatible storage: private bucket, SSE, short-lived signed URLs.
   private client: S3Client;
   private bucket: string;
-  private localFallback = new LocalStorage();
 
   constructor() {
-    const accountId = process.env.R2_ACCOUNT_ID!;
     this.bucket = process.env.R2_BUCKET!;
     this.client = new S3Client({
       region: "auto",
-      endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
+      endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
       credentials: {
         accessKeyId: process.env.R2_ACCESS_KEY_ID!,
         secretAccessKey: process.env.R2_SECRET_ACCESS_KEY!,
       },
-      // R2 requires path-style for some setups; virtual-hosted works with endpoint above.
-      forcePathStyle: false,
+      // Newer AWS SDKs add CRC32 checksum headers by default; only send them when required.
+      requestChecksumCalculation: "WHEN_REQUIRED",
+      responseChecksumValidation: "WHEN_REQUIRED",
+      maxAttempts: 3,
     });
   }
 
   async putObject(key: string, data: Buffer): Promise<void> {
+    if (!isSafeKey(key)) throw Object.assign(new Error("Invalid object key"), { statusCode: 400 });
     try {
       await this.client.send(
-        new PutObjectCommand({ Bucket: this.bucket, Key: key, Body: data, ServerSideEncryption: "AES256" })
+        new PutObjectCommand({ Bucket: this.bucket, Key: key, Body: data, ContentType: "application/json" }),
       );
     } catch (e) {
-      // Fail open to local fallback would silently split storage locations — don't.
-      // Surface the error so uploads visibly fail instead of vanishing.
-      throw new Error(`R2 putObject failed: ${(e as Error).message}`);
+      // Never fall back silently — a vanished upload is worse than a visible error.
+      throw new Error(`Object storage write failed: ${(e as Error).name}`);
     }
   }
 
   async getObject(key: string): Promise<Buffer | null> {
+    if (!isSafeKey(key)) return null;
     try {
       const res = await this.client.send(new GetObjectCommand({ Bucket: this.bucket, Key: key }));
       if (!res.Body) return null;
-      const chunks: Buffer[] = [];
-      for await (const chunk of res.Body as any) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-      }
-      return Buffer.concat(chunks);
-    } catch {
-      return null;
+      return Buffer.from(await res.Body.transformToByteArray());
+    } catch (e) {
+      const name = (e as Error).name;
+      if (name === "NoSuchKey" || name === "NotFound") return null;
+      throw new Error(`Object storage read failed: ${name}`);
     }
   }
 
   async generateSignedUrl(key: string, expiresInSeconds = 900): Promise<string> {
-    return getSignedUrl(this.client, new GetObjectCommand({ Bucket: this.bucket, Key: key }), {
-      expiresIn: expiresInSeconds,
-    });
+    return getSignedUrl(this.client, new GetObjectCommand({ Bucket: this.bucket, Key: key }), { expiresIn: expiresInSeconds });
   }
 
   async deleteObject(key: string): Promise<void> {
+    if (!isSafeKey(key)) return;
     try {
       await this.client.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: key }));
     } catch {
-      // best-effort delete
+      // best-effort
     }
   }
 }
 
-function r2Configured(): boolean {
-  return !!(
-    process.env.R2_ACCOUNT_ID &&
-    process.env.R2_ACCESS_KEY_ID &&
-    process.env.R2_SECRET_ACCESS_KEY &&
-    process.env.R2_BUCKET
-  );
+export function r2Configured(): boolean {
+  return !!(process.env.R2_ACCOUNT_ID && process.env.R2_ACCESS_KEY_ID && process.env.R2_SECRET_ACCESS_KEY && process.env.R2_BUCKET);
 }
 
 let singleton: StorageProvider | null = null;
@@ -145,22 +152,6 @@ export function _resetStorage(): void {
   singleton = null;
 }
 
-// Helper to build object key per spec §67
-export function buildObjectKey(params: {
-  userId: string;
-  projectId: string;
-  environmentId: string;
-  versionId: string;
-}): string {
-  return `users/${params.userId}/projects/${params.projectId}/environments/${params.environmentId}/versions/${params.versionId}`;
-}
-
-// For MVP where we don't have projectId yet, use canonicalRemote-based key (backward compat)
-export function buildLegacyObjectKey(params: {
-  userId: string;
-  canonicalRemote: string;
-  environmentName: string;
-  version: number;
-}): string {
-  return `users/${params.userId}/projects/${encodeURIComponent(params.canonicalRemote)}/environments/${params.environmentName}/versions/${params.version}`;
+export function buildObjectKey(params: { userId: string; projectId: string; environmentName: string; versionId: string }): string {
+  return `users/${params.userId}/projects/${params.projectId}/environments/${params.environmentName}/versions/${params.versionId}`;
 }

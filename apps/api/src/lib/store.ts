@@ -4,13 +4,17 @@ import * as path from "node:path";
 import * as dbStore from "./db-store.js";
 
 /**
- * Store facade: CockroachDB (via Drizzle) when configured, in-memory Maps otherwise.
+ * Store facade: CockroachDB/Postgres (via Drizzle) when configured, in-memory
+ * Maps otherwise. Routes call this facade and never care which backend is active.
+ *
+ * TENANCY INVARIANT: every project-scoped read/write takes the authenticated
+ * userId and resolves the project by (userId, canonicalRemote) or
+ * (userId, projectId). Nothing is ever looked up by canonicalRemote alone —
+ * two accounts pushing the same remote get fully separate histories.
+ *
  * - DB mode: DATABASE_URL set, migrations applied at boot (see initStore).
- *   Survives restarts and scales beyond one node. Legacy opaque tokens stay
- *   in-memory (JWT is the primary mechanism; old CLIs re-login after deploy).
- * - Memory mode (dev/test/no DATABASE_URL): previous behavior + crash-safe
- *   disk snapshot. Tests (VITEST) always use memory for determinism.
- * Routes call this facade and never care which backend is active.
+ * - Memory mode (dev/test/no DATABASE_URL): crash-safe disk snapshot.
+ *   Tests (VITEST) always use memory unless a test forces DB mode.
  */
 
 export interface UserRecord {
@@ -18,7 +22,7 @@ export interface UserRecord {
   email: string;
   name?: string | undefined;
   avatarUrl?: string | undefined;
-  /** scrypt hash (`scrypt$...`). Absent for legacy email-only accounts. */
+  /** scrypt hash (`scrypt$...`). Absent for passwordless (e.g. GitHub) accounts. */
   passwordHash?: string | undefined;
   createdAt: string;
   updatedAt: string;
@@ -59,17 +63,34 @@ export interface SecretVersionRecord {
   environmentFileId: string;
   objectKey: string;
   cipherAlgorithm: string;
-  algorithm?: string | undefined; // alias for cipherAlgorithm for EncryptedPayload compat
+  algorithm?: string | undefined;
   formatVersion?: number | undefined;
   keyVersion: number;
   nonce: string;
   authTag?: string | undefined;
-  ciphertext?: string | undefined; // for in-memory; prod stores only metadata + object storage
+  /** Encrypted blob only — never plaintext. */
+  ciphertext?: string | undefined;
   createdAt: string;
   createdBy?: string | undefined;
   canonicalRemote: string;
   fileName: string;
   environmentName: string;
+}
+
+export interface NewVersionInput {
+  /** Pre-generated so the object-storage write can happen before the row insert. */
+  id: string;
+  userId: string;
+  projectId: string;
+  environmentName: string;
+  fileName: string;
+  objectKey: string;
+  cipherAlgorithm: string;
+  formatVersion: number;
+  keyVersion: number;
+  nonce: string;
+  authTag?: string | undefined;
+  ciphertext: string;
 }
 
 export interface DeviceRecord {
@@ -82,24 +103,34 @@ export interface DeviceRecord {
   revokedAt?: string | null;
 }
 
-// In-memory stores
+type AuditEntry = {
+  id: string;
+  userId?: string | undefined;
+  projectId?: string | undefined;
+  action: string;
+  deviceId?: string | undefined;
+  ipHash?: string | undefined;
+  createdAt: string;
+};
+
+// ─── In-memory backend ───
 const users = new Map<string, UserRecord>(); // id -> user
-const usersByEmail = new Map<string, string>(); // email -> id
-const tokens = new Map<string, string>(); // token -> userId
-const projects = new Map<string, ProjectRecord>(); // key userId:canonical -> project OR id -> project
+const usersByEmail = new Map<string, string>(); // normalized email -> id
 const projectsById = new Map<string, ProjectRecord>();
+const projectsByKey = new Map<string, string>(); // `${userId}:${canonical}` -> projectId
 const environments = new Map<string, EnvironmentRecord>();
 const envFiles = new Map<string, EnvFileRecord>();
-const secretVersions = new Map<string, SecretVersionRecord[]>(); // key canonical:fileName -> versions
+const secretVersions = new Map<string, SecretVersionRecord[]>(); // `${projectId}:${fileName}` -> versions (asc)
 const devices = new Map<string, DeviceRecord>();
-const auditLogs: Array<{ id: string; userId?: string | undefined; projectId?: string | undefined; action: string; deviceId?: string | undefined; ipHash?: string | undefined; createdAt: string }> = [];
-// Revoked JWT ids (logout / refresh rotation). Persisted in snapshot; use Redis/DB when multi-node.
-const revokedJtis = new Set<string>();
+const auditLogs: AuditEntry[] = [];
+const revokedJtis = new Map<string, number>(); // jti -> expiresAt (ms)
+
+const now = () => new Date().toISOString();
+export const normalizeEmail = (email: string) => email.trim().toLowerCase();
 
 // ─── Backend selection ───
 let dbMode = false;
 
-/** True once initStore() has successfully switched to CockroachDB. */
 export function isDbMode(): boolean {
   return dbMode;
 }
@@ -112,8 +143,7 @@ export function __setDbMode(v: boolean): void {
 /**
  * Boot the store. With DATABASE_URL (and not under vitest): run migrations,
  * verify connectivity, and switch to the DB backend. In production a failure
- * here is fatal (loud > silently running on ephemeral memory); in dev we warn
- * and fall back to memory + snapshot so `pnpm dev` works without a database.
+ * here is fatal; in dev we warn and fall back to memory + snapshot.
  */
 export async function initStore(): Promise<"db" | "memory"> {
   const url = process.env.DATABASE_URL;
@@ -140,11 +170,9 @@ export async function initStore(): Promise<"db" | "memory"> {
   }
 }
 
-// ─── Crash-safe disk snapshot (single-node MVP) ───
-// In-memory Maps lose everything on restart. Until the store is fully
-// Drizzle-backed, we snapshot to disk (atomic write+rename) so a redeploy
-// or crash doesn't wipe users/projects/versions. Mount `data/` as a volume.
-// Disabled under vitest and when STORE_SNAPSHOT_DISABLED=1.
+// ─── Crash-safe disk snapshot (memory mode only) ───
+const SNAPSHOT_VERSION = 2;
+
 function snapshotPath(): string | null {
   if (process.env.STORE_SNAPSHOT_DISABLED === "1" || process.env.VITEST) return null;
   return process.env.STORE_SNAPSHOT_PATH ?? path.join(process.cwd(), "data", "api-store.json");
@@ -155,14 +183,11 @@ let saveInFlight = false;
 let saveQueued = false;
 
 function scheduleSnapshotSave(): void {
-  if (dbMode) return; // DB is the source of truth — no snapshot needed
-  if (!snapshotPath()) return;
-  if (saveTimer) return;
+  if (dbMode || !snapshotPath() || saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
     void flushSnapshot();
   }, 500);
-  // Allow process to exit without waiting for the debounce
   (saveTimer as any)?.unref?.();
 }
 
@@ -176,25 +201,18 @@ export async function flushSnapshot(): Promise<void> {
   }
   saveInFlight = true;
   try {
-    const payload = JSON.stringify(
-      {
-        version: 1,
-        savedAt: new Date().toISOString(),
-        users: [...users.values()],
-        usersByEmail: [...usersByEmail.entries()],
-        legacyTokens: [...tokens.entries()],
-        revokedJtis: [...revokedJtis],
-        projects: [...projects.entries()],
-        projectsById: [...projectsById.entries()],
-        environments: [...environments.entries()],
-        envFiles: [...envFiles.entries()],
-        secretVersions: [...secretVersions.entries()],
-        devices: [...devices.entries()],
-        auditLogs,
-      },
-      null,
-      0
-    );
+    const payload = JSON.stringify({
+      version: SNAPSHOT_VERSION,
+      savedAt: now(),
+      users: [...users.values()],
+      revokedJtis: [...revokedJtis.entries()],
+      projects: [...projectsById.values()],
+      environments: [...environments.values()],
+      envFiles: [...envFiles.values()],
+      secretVersions: [...secretVersions.entries()],
+      devices: [...devices.values()],
+      auditLogs: auditLogs.slice(-10_000),
+    });
     await fs.mkdir(path.dirname(file), { recursive: true });
     const tmp = `${file}.${process.pid}.tmp`;
     await fs.writeFile(tmp, payload, { mode: 0o600 });
@@ -215,32 +233,27 @@ export async function loadSnapshot(): Promise<boolean> {
   const file = snapshotPath();
   if (!file) return false;
   try {
-    const raw = await fs.readFile(file, "utf-8");
-    const s = JSON.parse(raw) as any;
-    if (!s || s.version !== 1) return false;
-    users.clear();
-    for (const u of s.users ?? []) users.set(u.id, u);
-    usersByEmail.clear();
-    for (const [k, v] of s.usersByEmail ?? []) usersByEmail.set(k, v);
-    tokens.clear();
-    for (const [k, v] of s.legacyTokens ?? []) tokens.set(k, v);
-    revokedJtis.clear();
-    for (const j of s.revokedJtis ?? []) revokedJtis.add(j);
-    projects.clear();
-    for (const [k, v] of s.projects ?? []) projects.set(k, v);
-    projectsById.clear();
-    for (const [k, v] of s.projectsById ?? []) projectsById.set(k, v);
-    environments.clear();
-    for (const [k, v] of s.environments ?? []) environments.set(k, v);
-    envFiles.clear();
-    for (const [k, v] of s.envFiles ?? []) envFiles.set(k, v);
-    secretVersions.clear();
+    const s = JSON.parse(await fs.readFile(file, "utf-8")) as any;
+    if (!s || s.version !== SNAPSHOT_VERSION) {
+      if (s?.version) console.warn(`[store] ignoring snapshot v${s.version} (expected v${SNAPSHOT_VERSION}) — legacy layout was not tenant-isolated`);
+      return false;
+    }
+    store._clearAll();
+    for (const u of s.users ?? []) {
+      users.set(u.id, u);
+      usersByEmail.set(normalizeEmail(u.email), u.id);
+    }
+    for (const [k, v] of s.revokedJtis ?? []) revokedJtis.set(k, v);
+    for (const p of s.projects ?? []) {
+      projectsById.set(p.id, p);
+      projectsByKey.set(`${p.userId}:${p.canonicalRemote}`, p.id);
+    }
+    for (const e of s.environments ?? []) environments.set(e.id, e);
+    for (const f of s.envFiles ?? []) envFiles.set(f.id, f);
     for (const [k, v] of s.secretVersions ?? []) secretVersions.set(k, v);
-    devices.clear();
-    for (const [k, v] of s.devices ?? []) devices.set(k, v);
-    auditLogs.length = 0;
+    for (const d of s.devices ?? []) devices.set(d.id, d);
     for (const l of s.auditLogs ?? []) auditLogs.push(l);
-    console.log(`[store] loaded snapshot (${s.users?.length ?? 0} users, ${s.projectsById?.length ?? 0} projects)`);
+    console.log(`[store] loaded snapshot (${users.size} users, ${projectsById.size} projects)`);
     return true;
   } catch (e: any) {
     if (e?.code !== "ENOENT") console.warn("[store] snapshot load failed:", e.message);
@@ -248,53 +261,64 @@ export async function loadSnapshot(): Promise<boolean> {
   }
 }
 
+// ─── Memory helpers ───
+function memEnsureEnvironment(projectId: string, name: string, createdBy?: string): EnvironmentRecord {
+  const existing = [...environments.values()].find((e) => e.projectId === projectId && e.name === name);
+  if (existing) return existing;
+  const rec: EnvironmentRecord = { id: randomUUID(), projectId, name, createdBy, createdAt: now(), updatedAt: now() };
+  environments.set(rec.id, rec);
+  return rec;
+}
+
+function memEnsureEnvFile(environmentId: string, fileName: string): EnvFileRecord {
+  const existing = [...envFiles.values()].find((f) => f.environmentId === environmentId && f.fileName === fileName);
+  if (existing) return existing;
+  const rec: EnvFileRecord = { id: randomUUID(), environmentId, fileName, createdAt: now(), updatedAt: now() };
+  envFiles.set(rec.id, rec);
+  return rec;
+}
+
 export const store = {
-  // Users
-  /** Ensure a user exists (no token issued). New auth routes use this + signed JWT. */
+  // ─── Users ───
   async ensureUser(email: string, name?: string): Promise<UserRecord> {
-    if (dbMode) return dbStore.dbEnsureUser(email, name);
-    let userId = usersByEmail.get(email);
-    let user = userId ? users.get(userId) : undefined;
+    const e = normalizeEmail(email);
+    if (dbMode) return dbStore.dbEnsureUser(e, name);
+    const id = usersByEmail.get(e);
+    let user = id ? users.get(id) : undefined;
     if (!user) {
-      userId = `user_${email}`;
-      user = {
-        id: userId,
-        email,
-        name,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-      users.set(userId, user);
-      usersByEmail.set(email, userId);
+      user = { id: randomUUID(), email: e, name, createdAt: now(), updatedAt: now() };
+      users.set(user.id, user);
+      usersByEmail.set(e, user.id);
       scheduleSnapshotSave();
     } else if (name && !user.name) {
       user.name = name;
-      user.updatedAt = new Date().toISOString();
+      user.updatedAt = now();
       scheduleSnapshotSave();
     }
     return user;
   },
 
-  async upsertUser(email: string): Promise<{ user: UserRecord; token: string }> {
-    const user = await this.ensureUser(email);
-    // Legacy opaque token (kept for backward compat with older CLI builds).
-    // In-memory in both modes; new clients receive signed JWTs instead.
-    const token = `envvault_mock_${Buffer.from(email).toString("base64").slice(0, 16)}_${randomUUID().slice(0, 8)}`;
-    tokens.set(token, user.id);
+  /** Create a user with a password atomically. Returns null if the email is taken. */
+  async createUserWithPassword(email: string, passwordHash: string, name?: string): Promise<UserRecord | null> {
+    const e = normalizeEmail(email);
+    if (dbMode) return dbStore.dbCreateUserWithPassword(e, passwordHash, name);
+    if (usersByEmail.has(e)) return null;
+    const user: UserRecord = { id: randomUUID(), email: e, name, passwordHash, createdAt: now(), updatedAt: now() };
+    users.set(user.id, user);
+    usersByEmail.set(e, user.id);
     scheduleSnapshotSave();
-    return { user, token };
-  },
-
-  async getUserByToken(token: string): Promise<UserRecord | null> {
-    const userId = tokens.get(token);
-    if (!userId) return null;
-    return users.get(userId) ?? null;
+    return user;
   },
 
   async getUserByEmail(email: string): Promise<UserRecord | null> {
-    if (dbMode) return dbStore.dbGetUserByEmail(email);
-    const id = usersByEmail.get(email);
-    if (!id) return null;
+    const e = normalizeEmail(email);
+    if (dbMode) return dbStore.dbGetUserByEmail(e);
+    const id = usersByEmail.get(e);
+    return id ? (users.get(id) ?? null) : null;
+  },
+
+  async getUserById(id: string): Promise<UserRecord | null> {
+    if (dbMode) return dbStore.dbGetUserById(id);
     return users.get(id) ?? null;
   },
 
@@ -303,13 +327,20 @@ export const store = {
     const u = users.get(userId);
     if (!u) throw new Error("User not found");
     u.passwordHash = passwordHash;
-    u.updatedAt = new Date().toISOString();
+    u.updatedAt = now();
     scheduleSnapshotSave();
   },
 
-  async revokeJti(jti: string): Promise<void> {
-    if (dbMode) return dbStore.dbRevokeJti(jti);
-    revokedJtis.add(jti);
+  // ─── JWT revocation ───
+  async revokeJti(jti: string, userId?: string, expiresAtSec?: number): Promise<void> {
+    const expMs = (expiresAtSec ?? Math.floor(Date.now() / 1000) + 30 * 24 * 3600) * 1000;
+    if (dbMode) return dbStore.dbRevokeJti(jti, userId, new Date(expMs));
+    revokedJtis.set(jti, expMs);
+    // Prune expired entries so the set doesn't grow forever.
+    if (revokedJtis.size % 100 === 0) {
+      const t = Date.now();
+      for (const [k, v] of revokedJtis) if (v < t) revokedJtis.delete(k);
+    }
     scheduleSnapshotSave();
   },
 
@@ -318,46 +349,26 @@ export const store = {
     return revokedJtis.has(jti);
   },
 
-  async revokeToken(token: string): Promise<void> {
-    tokens.delete(token);
-    scheduleSnapshotSave();
-  },
-
-  async rotateToken(oldToken: string): Promise<string | null> {
-    const userId = tokens.get(oldToken);
-    if (!userId) return null;
-    tokens.delete(oldToken);
-    const newToken = `envvault_mock_${randomUUID().slice(0, 16)}`;
-    tokens.set(newToken, userId);
-    scheduleSnapshotSave();
-    return newToken;
-  },
-
-  // Projects
+  // ─── Projects (always scoped by userId) ───
   async listProjects(userId: string): Promise<ProjectRecord[]> {
     if (dbMode) return dbStore.dbListProjects(userId);
-    return [...projectsById.values()].filter((p) => p.userId === userId);
+    return [...projectsById.values()].filter((p) => p.userId === userId).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   },
 
   async findProjectByCanonical(userId: string, canonical: string): Promise<ProjectRecord | null> {
     if (dbMode) return dbStore.dbFindProjectByCanonical(userId, canonical);
-    const key = `${userId}:${canonical}`;
-    return projects.get(key) ?? null;
+    const id = projectsByKey.get(`${userId}:${canonical}`);
+    return id ? (projectsById.get(id) ?? null) : null;
   },
 
+  /** Idempotent on (userId, canonicalRemote). */
   async createProject(data: Omit<ProjectRecord, "id" | "createdAt" | "updatedAt">): Promise<ProjectRecord> {
     if (dbMode) return dbStore.dbCreateProject(data);
-    const key = `${data.userId}:${data.canonicalRemote}`;
-    const existing = projects.get(key);
+    const existing = await this.findProjectByCanonical(data.userId, data.canonicalRemote);
     if (existing) return existing;
-    const rec: ProjectRecord = {
-      id: randomUUID(),
-      ...data,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-    projects.set(key, rec);
+    const rec: ProjectRecord = { id: randomUUID(), ...data, createdAt: now(), updatedAt: now() };
     projectsById.set(rec.id, rec);
+    projectsByKey.set(`${data.userId}:${data.canonicalRemote}`, rec.id);
     scheduleSnapshotSave();
     return rec;
   },
@@ -365,22 +376,32 @@ export const store = {
   async getProjectById(userId: string, id: string): Promise<ProjectRecord | null> {
     if (dbMode) return dbStore.dbGetProjectById(userId, id);
     const p = projectsById.get(id);
-    if (!p || p.userId !== userId) return null;
-    return p;
+    return p && p.userId === userId ? p : null;
   },
 
-  async deleteProject(userId: string, id: string): Promise<boolean> {
+  /** Deletes the project and everything under it. Returns the object keys to purge, or null if not found. */
+  async deleteProject(userId: string, id: string): Promise<string[] | null> {
     if (dbMode) return dbStore.dbDeleteProject(userId, id);
     const p = projectsById.get(id);
-    if (!p || p.userId !== userId) return false;
-    const key = `${userId}:${p.canonicalRemote}`;
-    projects.delete(key);
+    if (!p || p.userId !== userId) return null;
+    const keys: string[] = [];
+    for (const [k, list] of secretVersions) {
+      if (k.startsWith(`${id}:`)) {
+        keys.push(...list.map((v) => v.objectKey));
+        secretVersions.delete(k);
+      }
+    }
+    for (const env of [...environments.values()].filter((e) => e.projectId === id)) {
+      for (const f of [...envFiles.values()].filter((f) => f.environmentId === env.id)) envFiles.delete(f.id);
+      environments.delete(env.id);
+    }
+    projectsByKey.delete(`${userId}:${p.canonicalRemote}`);
     projectsById.delete(id);
     scheduleSnapshotSave();
-    return true;
+    return keys;
   },
 
-  // Environments
+  // ─── Environments / files (callers must authorize the project first) ───
   async listEnvironments(projectId: string): Promise<EnvironmentRecord[]> {
     if (dbMode) return dbStore.dbListEnvironments(projectId);
     return [...environments.values()].filter((e) => e.projectId === projectId);
@@ -388,17 +409,7 @@ export const store = {
 
   async createEnvironment(projectId: string, name: string, createdBy?: string | undefined): Promise<EnvironmentRecord> {
     if (dbMode) return dbStore.dbCreateEnvironment(projectId, name, createdBy);
-    const existing = [...environments.values()].find((e) => e.projectId === projectId && e.name === name);
-    if (existing) return existing;
-    const rec: EnvironmentRecord = {
-      id: randomUUID(),
-      projectId,
-      name,
-      createdBy,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-    environments.set(rec.id, rec);
+    const rec = memEnsureEnvironment(projectId, name, createdBy);
     scheduleSnapshotSave();
     return rec;
   },
@@ -408,7 +419,6 @@ export const store = {
     return environments.get(id) ?? null;
   },
 
-  // Env Files
   async listEnvFiles(environmentId: string): Promise<EnvFileRecord[]> {
     if (dbMode) return dbStore.dbListEnvFiles(environmentId);
     return [...envFiles.values()].filter((f) => f.environmentId === environmentId);
@@ -416,31 +426,42 @@ export const store = {
 
   async createEnvFile(environmentId: string, fileName: string): Promise<EnvFileRecord> {
     if (dbMode) return dbStore.dbCreateEnvFile(environmentId, fileName);
-    const existing = [...envFiles.values()].find((f) => f.environmentId === environmentId && f.fileName === fileName);
-    if (existing) return existing;
-    const rec: EnvFileRecord = {
-      id: randomUUID(),
-      environmentId,
-      fileName,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-    envFiles.set(rec.id, rec);
+    const rec = memEnsureEnvFile(environmentId, fileName);
     scheduleSnapshotSave();
     return rec;
   },
 
-  // Secret Versions
-  async addVersion(v: Omit<SecretVersionRecord, "id" | "version" | "createdAt">): Promise<SecretVersionRecord> {
+  // ─── Secret versions ───
+  /**
+   * Append a version to the user's project. Version numbers are sequential
+   * per (project, fileName) — the CLI lists by (canonicalRemote, fileName)
+   * and treats the last entry as latest.
+   */
+  async addVersion(v: NewVersionInput): Promise<SecretVersionRecord> {
     if (dbMode) return dbStore.dbAddVersion(v);
-    const key = `${v.canonicalRemote}:${v.fileName}`;
+    const proj = projectsById.get(v.projectId);
+    if (!proj || proj.userId !== v.userId) throw new Error("Project not found");
+    const env = memEnsureEnvironment(v.projectId, v.environmentName, v.userId);
+    const file = memEnsureEnvFile(env.id, v.fileName);
+    const key = `${v.projectId}:${v.fileName}`;
     const list = secretVersions.get(key) ?? [];
-    const version = list.length + 1;
     const rec: SecretVersionRecord = {
-      id: randomUUID(),
-      version,
-      ...v,
-      createdAt: new Date().toISOString(),
+      id: v.id,
+      version: (list.at(-1)?.version ?? 0) + 1,
+      environmentFileId: file.id,
+      objectKey: v.objectKey,
+      cipherAlgorithm: v.cipherAlgorithm,
+      algorithm: v.cipherAlgorithm,
+      formatVersion: v.formatVersion,
+      keyVersion: v.keyVersion,
+      nonce: v.nonce,
+      authTag: v.authTag,
+      ciphertext: v.ciphertext,
+      createdAt: now(),
+      createdBy: v.userId,
+      canonicalRemote: proj.canonicalRemote,
+      fileName: v.fileName,
+      environmentName: v.environmentName,
     };
     list.push(rec);
     secretVersions.set(key, list);
@@ -448,32 +469,32 @@ export const store = {
     return rec;
   },
 
-  async listVersions(canonical: string, fileName: string): Promise<SecretVersionRecord[]> {
-    if (dbMode) return dbStore.dbListVersions(canonical, fileName);
-    return secretVersions.get(`${canonical}:${fileName}`) ?? [];
+  /** Versions for the user's project at canonicalRemote, ascending. Empty if the user has no such project. */
+  async listVersions(userId: string, canonical: string, fileName: string): Promise<SecretVersionRecord[]> {
+    if (dbMode) return dbStore.dbListVersions(userId, canonical, fileName);
+    const proj = await this.findProjectByCanonical(userId, canonical);
+    if (!proj) return [];
+    return [...(secretVersions.get(`${proj.id}:${fileName}`) ?? [])];
   },
 
-  async getVersionByNumber(canonical: string, fileName: string, version: number): Promise<SecretVersionRecord | null> {
-    if (dbMode) return dbStore.dbGetVersionByNumber(canonical, fileName, version);
-    const list = secretVersions.get(`${canonical}:${fileName}`) ?? [];
+  async getVersionByNumber(userId: string, canonical: string, fileName: string, version: number): Promise<SecretVersionRecord | null> {
+    const list = await this.listVersions(userId, canonical, fileName);
     return list.find((v) => v.version === version) ?? null;
   },
 
-  // Devices
+  // ─── Devices (always scoped by userId) ───
   async registerDevice(userId: string, name: string, platform?: string | undefined): Promise<DeviceRecord> {
     if (dbMode) return dbStore.dbRegisterDevice(userId, name, platform);
-    const rec: DeviceRecord = {
-      id: randomUUID(),
-      userId,
-      name,
-      platform,
-      lastSeenAt: new Date().toISOString(),
-      createdAt: new Date().toISOString(),
-      revokedAt: null,
-    };
+    const rec: DeviceRecord = { id: randomUUID(), userId, name, platform, lastSeenAt: now(), createdAt: now(), revokedAt: null };
     devices.set(rec.id, rec);
     scheduleSnapshotSave();
     return rec;
+  },
+
+  async getDevice(userId: string, deviceId: string): Promise<DeviceRecord | null> {
+    if (dbMode) return dbStore.dbGetDevice(userId, deviceId);
+    const d = devices.get(deviceId);
+    return d && d.userId === userId ? d : null;
   },
 
   async listDevices(userId: string): Promise<DeviceRecord[]> {
@@ -481,42 +502,42 @@ export const store = {
     return [...devices.values()].filter((d) => d.userId === userId && !d.revokedAt);
   },
 
-  async revokeDevice(deviceId: string): Promise<void> {
-    if (dbMode) return dbStore.dbRevokeDevice(deviceId);
+  /** Returns false if the device doesn't exist or belongs to someone else. */
+  async revokeDevice(userId: string, deviceId: string): Promise<boolean> {
+    if (dbMode) return dbStore.dbRevokeDevice(userId, deviceId);
     const d = devices.get(deviceId);
-    if (d) {
-      d.revokedAt = new Date().toISOString();
-      scheduleSnapshotSave();
-    }
+    if (!d || d.userId !== userId || d.revokedAt) return false;
+    d.revokedAt = now();
+    scheduleSnapshotSave();
+    return true;
   },
 
-  // Audit
-  async audit(entry: { userId?: string | undefined; projectId?: string | undefined; action: string; deviceId?: string | undefined; ipHash?: string | undefined }): Promise<void> {
+  async touchDevice(deviceId: string): Promise<void> {
+    if (dbMode) return dbStore.dbTouchDevice(deviceId);
+    const d = devices.get(deviceId);
+    if (d) d.lastSeenAt = now();
+  },
+
+  // ─── Audit ───
+  async audit(entry: Omit<AuditEntry, "id" | "createdAt">): Promise<void> {
     if (dbMode) return dbStore.dbAudit(entry);
-    auditLogs.push({
-      id: randomUUID(),
-      ...entry,
-      createdAt: new Date().toISOString(),
-    });
-    // Never log secret values — entry is metadata only
-    // Audit writes are frequent; snapshot is debounced so this is cheap.
+    auditLogs.push({ id: randomUUID(), ...entry, createdAt: now() });
+    if (auditLogs.length > 50_000) auditLogs.splice(0, auditLogs.length - 50_000);
     scheduleSnapshotSave();
   },
 
-  async listAuditLogs(userId?: string): Promise<typeof auditLogs> {
-    if (dbMode) return dbStore.dbListAuditLogs(userId) as Promise<typeof auditLogs>;
-    if (!userId) return auditLogs;
-    return auditLogs.filter((l) => l.userId === userId);
+  async listAuditLogs(userId?: string): Promise<AuditEntry[]> {
+    if (dbMode) return dbStore.dbListAuditLogs(userId) as Promise<AuditEntry[]>;
+    return userId ? auditLogs.filter((l) => l.userId === userId) : [...auditLogs];
   },
 
   // Testing helper
   _clearAll(): void {
     users.clear();
     usersByEmail.clear();
-    tokens.clear();
     revokedJtis.clear();
-    projects.clear();
     projectsById.clear();
+    projectsByKey.clear();
     environments.clear();
     envFiles.clear();
     secretVersions.clear();

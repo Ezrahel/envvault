@@ -1,54 +1,222 @@
 @import "tailwindcss";
 
+/* ──────────────────────────────────────────────────────────────
+   EnvVault design system — "Cipher"
+   Near-black base, white type, one signal accent (volt lime) and
+   an atmospheric violet used only for glow/3D. Fonts are system
+   stacks on purpose (offline / Docker-safe builds).
+   ────────────────────────────────────────────────────────────── */
+
+@theme {
+  --color-ink-950: #050507;
+  --color-ink-900: #0a0a0f;
+  --color-ink-850: #0e0e14;
+  --color-ink-800: #13131b;
+  --color-ink-700: #1c1c27;
+  --color-ink-600: #2a2a38;
+
+  --color-volt: #c6ff4a;
+  --color-volt-dim: #9fd12e;
+  --color-iris: #8b7cff;
+  --color-iris-dim: #5b4fd1;
+  --color-danger: #ff5c7a;
+
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, "Liberation Mono", monospace;
+
+  --animate-marquee: marquee var(--marquee-duration, 40s) linear infinite;
+  --animate-spin-slow: spin 18s linear infinite;
+  --animate-float: float 6s ease-in-out infinite;
+  --animate-shimmer: shimmer 2.4s linear infinite;
+  --animate-pulse-ring: pulse-ring 2.4s cubic-bezier(0.2, 0.6, 0.3, 1) infinite;
+
+  @keyframes marquee {
+    from { transform: translateX(0); }
+    to { transform: translateX(-50%); }
+  }
+  @keyframes float {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-10px); }
+  }
+  @keyframes shimmer {
+    from { background-position: 200% 0; }
+    to { background-position: -200% 0; }
+  }
+  @keyframes pulse-ring {
+    0% { transform: scale(0.8); opacity: 0.7; }
+    100% { transform: scale(2.4); opacity: 0; }
+  }
+}
+
 :root {
-  --bg-base: #0a0a0a;
-  --bg-card: #111111;
-  --bg-elevated: #171717;
-  --border: #222222;
-  --border-strong: #333333;
-  --text-primary: #fafafa;
-  --text-secondary: #a1a1aa; /* zinc-400 */
-  --text-tertiary: #71717a; /* zinc-500 */
-  /* System font stacks — no network fetch, deploy-safe fallback for Geist */
-  --font-geist-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  --font-geist-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  color-scheme: dark;
+  --bg: var(--color-ink-950);
+  --surface: rgba(255, 255, 255, 0.025);
+  --surface-strong: rgba(255, 255, 255, 0.05);
+  --line: rgba(255, 255, 255, 0.08);
+  --line-strong: rgba(255, 255, 255, 0.14);
+  --text: #f4f4f6;
+  --text-dim: #a3a3b2;
+  --text-faint: #6b6b7b;
 }
 
 html {
-  font-size: 17px; /* bump base from 16px → 17px for overall legibility +6% */
+  font-size: 17px;
+  background: var(--bg);
 }
 
-* {
-  border-color: var(--border);
-}
+/* Lenis smooth scroll */
+html.lenis, html.lenis body { height: auto; }
+.lenis.lenis-smooth { scroll-behavior: auto !important; }
+.lenis.lenis-smooth [data-lenis-prevent] { overscroll-behavior: contain; }
+.lenis.lenis-stopped { overflow: hidden; }
+
+* { border-color: var(--line); }
 
 body {
-  background: var(--bg-base);
-  color: var(--text-primary);
-  font-feature-settings: "rlig" 1, "calt" 1;
+  background: var(--bg);
+  color: var(--text);
+  font-feature-settings: "rlig" 1, "calt" 1, "ss01" 1;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
 }
 
-/* Focus ring monochrome */
+::selection { background: var(--color-volt); color: #000; }
+
 *:focus-visible {
-  outline: none;
-  ring: 1px;
-  --tw-ring-color: #52525b;
+  outline: 2px solid var(--color-volt);
+  outline-offset: 2px;
+  border-radius: 6px;
 }
 
-/* Scrollbar monochrome */
-::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: #22222e; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #33334a; }
+
+/* ── Reusable surfaces ─────────────────────────────────────── */
+
+@utility glass {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.015));
+  border: 1px solid var(--line);
+  backdrop-filter: blur(14px) saturate(140%);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
 }
-::-webkit-scrollbar-track {
-  background: #0a0a0a;
+
+/* 1px gradient border via mask — used on hero cards / pricing. */
+@utility ring-gradient {
+  position: relative;
+  &::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    padding: 1px;
+    border-radius: inherit;
+    background: linear-gradient(140deg, rgba(198, 255, 74, 0.55), rgba(139, 124, 255, 0.25) 40%, rgba(255, 255, 255, 0.06) 70%);
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    pointer-events: none;
+  }
 }
-::-webkit-scrollbar-thumb {
-  background: #27272a;
-  border-radius: 4px;
+
+@utility text-gradient {
+  background: linear-gradient(180deg, #ffffff 20%, #9a9aac 110%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
 }
-::-webkit-scrollbar-thumb:hover {
-  background: #3f3f46;
+
+@utility text-volt-gradient {
+  background: linear-gradient(100deg, var(--color-volt) 0%, #e9ffb5 45%, var(--color-iris) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+@utility bg-grid {
+  background-image:
+    linear-gradient(to right, rgba(255, 255, 255, 0.045) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.045) 1px, transparent 1px);
+  background-size: 44px 44px;
+}
+
+@utility bg-dots {
+  background-image: radial-gradient(rgba(255, 255, 255, 0.09) 1px, transparent 1px);
+  background-size: 18px 18px;
+}
+
+@utility mask-fade-y {
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 15%, #000 85%, transparent);
+  mask-image: linear-gradient(to bottom, transparent, #000 15%, #000 85%, transparent);
+}
+
+@utility mask-fade-x {
+  -webkit-mask-image: linear-gradient(to right, transparent, #000 10%, #000 90%, transparent);
+  mask-image: linear-gradient(to right, transparent, #000 10%, #000 90%, transparent);
+}
+
+@utility mask-radial {
+  -webkit-mask-image: radial-gradient(ellipse at center, #000 30%, transparent 75%);
+  mask-image: radial-gradient(ellipse at center, #000 30%, transparent 75%);
+}
+
+/* Spotlight card: JS sets --mx / --my on pointer move. */
+.spotlight {
+  position: relative;
+  isolation: isolate;
+}
+.spotlight::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: radial-gradient(420px circle at var(--mx, 50%) var(--my, -20%), rgba(198, 255, 74, 0.09), transparent 45%);
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  pointer-events: none;
+  z-index: -1;
+}
+.spotlight:hover::after { opacity: 1; }
+
+/* Rotating conic border (pricing "Pro", primary CTAs). */
+@property --angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+.conic-border {
+  position: relative;
+  isolation: isolate;
+}
+.conic-border::before {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  padding: 1px;
+  background: conic-gradient(from var(--angle), transparent 0deg, var(--color-volt) 60deg, var(--color-iris) 120deg, transparent 180deg, transparent 360deg);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  animation: conic-spin 5s linear infinite;
+  z-index: -1;
+}
+@keyframes conic-spin { to { --angle: 360deg; } }
+
+/* Syntax colours for the .env editor and terminals */
+.tok-key { color: #e9e9f2; }
+.tok-eq { color: #6b6b7b; }
+.tok-val { color: var(--color-volt); }
+.tok-str { color: #b4f07a; }
+.tok-com { color: #5e5e70; font-style: italic; }
+.tok-num { color: var(--color-iris); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
 }

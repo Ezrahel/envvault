@@ -34,11 +34,11 @@ describe("API integration", () => {
       method: "POST",
       url: "/v1/projects",
       headers: { Authorization: `Bearer ${token}` },
-      payload: { provider: "github", host: "github.com", owner: "<username>", repository: "<repository>", canonicalRemote: "github.com/<username>/<repository>" },
+      payload: { provider: "github", host: "github.com", owner: "acme", repository: "web", canonicalRemote: "github.com/acme/web" },
     });
     expect(r.statusCode).toBe(201);
     const proj = JSON.parse(r.body);
-    expect(proj.canonicalRemote).toBe("github.com/<username>/<repository>");
+    expect(proj.canonicalRemote).toBe("github.com/acme/web");
 
     // list again
     r = await app.inject({ method: "GET", url: "/v1/projects", headers: { Authorization: `Bearer ${token}` } });
@@ -66,7 +66,7 @@ describe("API integration", () => {
 
     // upload encrypted payload (ciphertext only)
     const payload = {
-      project: { provider: "github", host: "github.com", owner: "<username>", repository: "<repository>", canonicalRemote: "github.com/<username>/<repository>" },
+      project: { provider: "github", host: "github.com", owner: "acme", repository: "web", canonicalRemote: "github.com/acme/web" },
       environment: { name: "development", fileName: ".env.local" },
       encryption: { algorithm: "AES-256-GCM", keyVersion: 1, nonce: "abc", authTag: "def" },
       ciphertext: "ENCRYPTED_CIPHERTEXT_BASE64",
@@ -83,7 +83,7 @@ describe("API integration", () => {
     // list versions via query (canonicalRemote)
     r = await app.inject({
       method: "GET",
-      url: `/v1/environment-files/mock/versions?canonicalRemote=${encodeURIComponent("github.com/<username>/<repository>")}&fileName=.env.local`,
+      url: `/v1/environment-files/mock/versions?canonicalRemote=${encodeURIComponent("github.com/acme/web")}&fileName=.env.local`,
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(r.statusCode).toBe(200);

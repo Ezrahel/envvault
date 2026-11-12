@@ -1,36 +1,29 @@
-import { store } from "./store.js";
+import { createHmac } from "node:crypto";
 import type { FastifyRequest } from "fastify";
-import { createHash } from "node:crypto";
+import { store } from "./store.js";
 
+/**
+ * Keyed hash of the client IP (never stored raw). Keyed with the JWT secret so
+ * the 2^32 IPv4 space can't be brute-forced back from the hash.
+ */
 export function hashIp(ip: string): string {
-  // Hash IP for privacy per spec §31 audit_logs ip_hash
-  return createHash("sha256").update(ip).digest("hex").slice(0, 16);
+  const key = process.env.JWT_SECRET ?? "envvault-dev-ip-key";
+  return createHmac("sha256", key).update(ip).digest("hex").slice(0, 16);
 }
 
+/** Record a metadata-only audit event. Never throws — auditing must not fail a request. */
 export async function auditLog(
   request: FastifyRequest,
   action: string,
-  meta: { userId?: string | undefined; projectId?: string | undefined; deviceId?: string | undefined } = {}
+  meta: { userId?: string | undefined; projectId?: string | undefined; deviceId?: string | undefined } = {},
 ): Promise<void> {
-  const userId = (request as any).user?.id ?? meta.userId;
+  const userId = request.user?.id ?? meta.userId;
+  const deviceId = request.user?.deviceId ?? meta.deviceId;
   const projectId = meta.projectId;
-  const deviceId = (request as any).user?.deviceId ?? meta.deviceId;
-  const ip = (request.ip as string) ?? "unknown";
-  const ipHash = hashIp(ip);
-
-  // Never log secret values — only metadata
-  if (action.includes("SECRET") || action.includes("DATABASE_URL")) {
-    action = "[redacted]";
+  try {
+    await store.audit({ userId, projectId, action, deviceId, ipHash: hashIp(request.ip ?? "unknown") });
+  } catch (e) {
+    request.log.warn({ err: (e as Error).message, action }, "audit write failed");
   }
-
-  await store.audit({
-    userId,
-    projectId,
-    action,
-    deviceId,
-    ipHash,
-  });
-
-  // Structured log for observability per §73
-  (request as any).log?.info({ event: action, userId, projectId, deviceId }, action);
+  request.log.info({ event: action, userId, projectId, deviceId }, action);
 }

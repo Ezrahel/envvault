@@ -19,6 +19,17 @@ const envSchema = z.object({
   R2_ACCESS_KEY_ID: z.string().optional(),
   R2_SECRET_ACCESS_KEY: z.string().optional(),
   R2_BUCKET: z.string().optional(),
+  GITHUB_CLIENT_ID: z.string().optional(),
+  GITHUB_CLIENT_SECRET: z.string().optional(),
+  // Reverse-proxy trust for client IPs (rate limiting + audit hashing).
+  // "true" = trust X-Forwarded-For from any hop, a number = trust that many hops,
+  // "false" = API is exposed directly. Default true (typical: behind a load balancer).
+  TRUST_PROXY: z.string().default("true"),
+  // Request rate limits per client IP per minute.
+  RATE_LIMIT_MAX: z.coerce.number().int().positive().default(300),
+  AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(10),
+  // Public base URL of this API (used in signed local-storage URLs).
+  PUBLIC_API_URL: z.string().url().optional(),
   STORE_SNAPSHOT_PATH: z.string().optional(),
   STORE_SNAPSHOT_DISABLED: z.string().optional(),
 });
@@ -44,6 +55,13 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): ServerEnv {
     if (problems.length > 0) {
       throw new Error(`Production env misconfigured:\n- ${problems.join("\n- ")}`);
     }
+    if (!!env.GITHUB_CLIENT_ID !== !!env.GITHUB_CLIENT_SECRET) {
+      console.warn("[env] Only one of GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET is set — GitHub OAuth stays disabled.");
+    }
+    const r2 = [env.R2_ACCOUNT_ID, env.R2_ACCESS_KEY_ID, env.R2_SECRET_ACCESS_KEY, env.R2_BUCKET].filter(Boolean).length;
+    if (r2 > 0 && r2 < 4) {
+      throw new Error("Production env misconfigured:\n- R2 is partially configured. Set all of R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET (or none).");
+    }
     if (!env.CORS_ORIGINS) {
       console.warn("[env] CORS_ORIGINS not set in production — API will reject browser origins except same-origin. Set to your app URL(s).");
     }
@@ -58,4 +76,12 @@ export function corsOrigins(env: Pick<ServerEnv, "CORS_ORIGINS" | "NODE_ENV">): 
     return env.NODE_ENV === "production" ? false : [/^http:\/\/localhost:\d+$/, /^http:\/\/127\.0\.0\.1:\d+$/];
   }
   return env.CORS_ORIGINS.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+export function trustProxySetting(v: string): boolean | number {
+  const t = v.trim().toLowerCase();
+  if (t === "false" || t === "0" || t === "") return false;
+  if (t === "true") return true;
+  const n = Number(t);
+  return Number.isInteger(n) && n > 0 ? n : true;
 }

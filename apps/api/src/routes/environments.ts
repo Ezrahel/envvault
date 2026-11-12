@@ -3,54 +3,58 @@ import { z } from "zod";
 import { authenticate, requireUser } from "../lib/auth.js";
 import { store } from "../lib/store.js";
 import { auditLog } from "../lib/audit.js";
+import { envNameSchema, fileNameSchema, uuidParam, zodMessage } from "../lib/validate.js";
 
 export async function environmentRoutes(app: FastifyInstance) {
-  app.get("/projects/:id/environments", { preHandler: [authenticate] }, async (req, reply) => {
+  app.addHook("preHandler", authenticate);
+
+  /** Resolve an environment the caller owns (via its project), or null. */
+  async function ownedEnvironment(userId: string, params: unknown) {
+    const p = uuidParam.safeParse(params);
+    if (!p.success) return null;
+    const env = await store.getEnvironment(p.data.id);
+    if (!env) return null;
+    const proj = await store.getProjectById(userId, env.projectId);
+    return proj ? env : null;
+  }
+
+  app.get("/projects/:id/environments", async (req, reply) => {
     const user = requireUser(req);
-    const { id } = (req as any).params;
-    // Authorization: verify project belongs to user
-    const proj = await store.getProjectById(user.id, id);
+    const p = uuidParam.safeParse(req.params);
+    const proj = p.success ? await store.getProjectById(user.id, p.data.id) : null;
     if (!proj) return reply.status(404).send({ error: "Project not found" });
-    return store.listEnvironments(id);
+    return store.listEnvironments(proj.id);
   });
 
-  app.post("/projects/:id/environments", { preHandler: [authenticate] }, async (req, reply) => {
+  app.post("/projects/:id/environments", async (req, reply) => {
     const user = requireUser(req);
-    const { id } = (req as any).params;
-    const proj = await store.getProjectById(user.id, id);
+    const p = uuidParam.safeParse(req.params);
+    const proj = p.success ? await store.getProjectById(user.id, p.data.id) : null;
     if (!proj) return reply.status(404).send({ error: "Project not found" });
-    const schema = z.object({ name: z.string().min(1).max(100) });
-    const parsed = schema.safeParse((req as any).body);
-    if (!parsed.success) return reply.status(400).send({ error: parsed.error.message });
-
-    const env = await store.createEnvironment(id, parsed.data.name, user.id);
-    await auditLog(req as any, "environment.create", { userId: user.id, projectId: id });
+    const parsed = z.object({ name: envNameSchema }).safeParse(req.body);
+    if (!parsed.success) return reply.status(400).send({ error: zodMessage(parsed.error) });
+    const env = await store.createEnvironment(proj.id, parsed.data.name, user.id);
+    await auditLog(req, "environment.create", { projectId: proj.id });
     reply.status(201);
     return env;
   });
 
-  app.get("/environments/:id/files", { preHandler: [authenticate] }, async (req, reply) => {
+  // 404 (not 403) for other users' resources: don't confirm that an id exists.
+  app.get("/environments/:id/files", async (req, reply) => {
     const user = requireUser(req);
-    const { id } = (req as any).params;
-    const env = await store.getEnvironment(id);
+    const env = await ownedEnvironment(user.id, req.params);
     if (!env) return reply.status(404).send({ error: "Environment not found" });
-    const proj = await store.getProjectById(user.id, env.projectId);
-    if (!proj) return reply.status(403).send({ error: "Forbidden" });
-    return store.listEnvFiles(id);
+    return store.listEnvFiles(env.id);
   });
 
-  app.post("/environments/:id/files", { preHandler: [authenticate] }, async (req, reply) => {
+  app.post("/environments/:id/files", async (req, reply) => {
     const user = requireUser(req);
-    const { id } = (req as any).params;
-    const env = await store.getEnvironment(id);
+    const env = await ownedEnvironment(user.id, req.params);
     if (!env) return reply.status(404).send({ error: "Environment not found" });
-    const proj = await store.getProjectById(user.id, env.projectId);
-    if (!proj) return reply.status(403).send({ error: "Forbidden" });
-    const schema = z.object({ fileName: z.string().min(1).max(100) });
-    const parsed = schema.safeParse((req as any).body);
-    if (!parsed.success) return reply.status(400).send({ error: parsed.error.message });
-    const file = await store.createEnvFile(id, parsed.data.fileName);
-    await auditLog(req as any, "environment_file.create", { userId: user.id, projectId: env.projectId });
+    const parsed = z.object({ fileName: fileNameSchema }).safeParse(req.body);
+    if (!parsed.success) return reply.status(400).send({ error: zodMessage(parsed.error) });
+    const file = await store.createEnvFile(env.id, parsed.data.fileName);
+    await auditLog(req, "environment_file.create", { projectId: env.projectId });
     reply.status(201);
     return file;
   });

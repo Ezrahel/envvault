@@ -51,6 +51,8 @@ services:
       R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
       R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
       R2_BUCKET: ${R2_BUCKET:-}
+      TRUST_PROXY: ${TRUST_PROXY:-true}
+      PUBLIC_API_URL: ${PUBLIC_API_URL:-}
     volumes:
       # Crash-safe snapshot for memory-mode fallback (unused when DB backend is active).
       - apidata:/app/data
@@ -59,7 +61,7 @@ services:
       cockroach-init:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
       interval: 15s
       timeout: 5s
       retries: 3

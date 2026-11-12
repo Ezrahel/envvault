@@ -52,7 +52,8 @@ export function splitStatements(sqlText: string): string[] {
 
 export async function runMigrations(databaseUrl = process.env.DATABASE_URL): Promise<string[]> {
   if (!databaseUrl) throw new Error("DATABASE_URL is not set — cannot run migrations");
-  const client = postgres(normalizeDatabaseUrl(databaseUrl), { max: 1, prepare: false });
+  // onnotice: Cockroach/PG emit "already exists, skipping" NOTICEs for IF NOT EXISTS — not log-worthy.
+  const client = postgres(normalizeDatabaseUrl(databaseUrl), { max: 1, prepare: false, onnotice: () => {} });
   try {
     await client.unsafe(
       `CREATE TABLE IF NOT EXISTS "${MIGRATIONS_TABLE}" (filename text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())`
@@ -69,7 +70,8 @@ export async function runMigrations(databaseUrl = process.env.DATABASE_URL): Pro
       for (const stmt of splitStatements(sqlText)) {
         await client.unsafe(stmt);
       }
-      await client.unsafe(`INSERT INTO "${MIGRATIONS_TABLE}" (filename) VALUES ($1)`, [name]);
+      // ON CONFLICT: two instances booting at once must not crash each other.
+      await client.unsafe(`INSERT INTO "${MIGRATIONS_TABLE}" (filename) VALUES ($1) ON CONFLICT (filename) DO NOTHING`, [name]);
       newlyApplied.push(name);
     }
     if (newlyApplied.length > 0) {

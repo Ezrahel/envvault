@@ -9,18 +9,22 @@ export function Empty({
 }: {
   icon?: React.ElementType;
   title: string;
-  description: string;
+  description: React.ReactNode;
   action?: { label: string; href?: string; onClick?: () => void };
 }) {
   return (
-    <div className="rounded-lg border border-dashed border-zinc-800 bg-zinc-950 px-6 py-12 text-center">
-      <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full border border-zinc-800 bg-zinc-900">
-        <Icon className="h-6 w-6 text-zinc-500" />
+    <div className="glass relative overflow-hidden rounded-2xl border-dashed px-6 py-14 text-center">
+      <div aria-hidden className="bg-dots absolute inset-0 opacity-40 [mask-image:radial-gradient(ellipse_at_center,#000,transparent_70%)]" />
+      <div className="relative mx-auto grid h-14 w-14 place-items-center">
+        <span className="animate-pulse-ring absolute inset-0 rounded-2xl border border-volt/30" />
+        <span className="relative grid h-14 w-14 place-items-center rounded-2xl border border-white/10 bg-ink-800">
+          <Icon className="h-6 w-6 text-volt" />
+        </span>
       </div>
-      <h3 className="mt-4 text-sm font-semibold text-white">{title}</h3>
-      <p className="mx-auto mt-1 max-w-[420px] text-xs text-zinc-400">{description}</p>
+      <h3 className="relative mt-5 text-sm font-semibold text-white">{title}</h3>
+      <p className="relative mx-auto mt-1.5 max-w-[420px] text-xs leading-5 text-zinc-400">{description}</p>
       {action && (
-        <div className="mt-4">
+        <div className="relative mt-5">
           {action.href ? (
             <a href={action.href}>
               <Button variant="primary" size="sm">{action.label}</Button>
@@ -36,10 +40,10 @@ export function Empty({
 
 export function EmptySearch({ onClear }: { onClear?: () => void }) {
   return (
-    <div className="rounded-lg border border-zinc-800 bg-zinc-950 px-6 py-8 text-center">
+    <div className="glass rounded-2xl px-6 py-10 text-center">
       <SearchX className="mx-auto h-8 w-8 text-zinc-600" />
       <p className="mt-2 text-sm text-zinc-400">No results found</p>
-      {onClear && <button onClick={onClear} className="mt-2 text-xs text-zinc-300 underline decoration-zinc-700 underline-offset-4">Clear filter</button>}
+      {onClear && <button onClick={onClear} className="mt-2 text-xs text-volt underline decoration-volt/30 underline-offset-4">Clear filter</button>}
     </div>
   );
 }
